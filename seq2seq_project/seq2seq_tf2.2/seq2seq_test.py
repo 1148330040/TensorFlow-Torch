@@ -61,7 +61,7 @@ def get_dataset():
         lambda x: ''.join(re.findall(pattern=pattern, string=x))
     )
 
-    return pd.DataFrame(dataset)
+    # return pd.DataFrame(dataset)
 
 
 def process_word(dataset=None):
