@@ -1,0 +1,5 @@
+seq2seq_project/news_dataset_clean/*
+seq2seq_project/seq2seq_tf2.2/seq2seq_config.json
+
+crf_project/dataset/*
+pretrain_models/*
