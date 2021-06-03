@@ -8,65 +8,28 @@ import tensorflow as tf
 import tensorflow_addons as tfa
 
 from tensorflow_addons.text.crf import crf_log_likelihood
+from bert4keras.models import build_transformer_model
+
+path = '../../pretrain_models/chinese_wwm_ext_L-12_H-768_A-12/'
+
+config_path = path + 'bert_config.json'
+model_path = path + 'bert_model.ckpt'
+vocab_path = path + 'vocab.txt'
+
+num_class = len(['O', 'I-LOC', 'B-LOC', 'I-ORG', 'B-ORG', 'B-PER', 'I-PER']) + 3
 
 
-def get_data(data):
-    if len(data) == 2:
-        return data[0], data[1]
-        # x, y
-    elif len(data) == 3:
-        return data
-        # x, y, weights
-    else:
-        raise TypeError("Expect data is a tuple of size is 2 or 3")
 
-
-class CrfLossModel(tf.keras.Model):
-    def __init__(self, base_model):
-        super().__init__()
-        self.base_model = base_model
-
-    def call(self, inputs, training=None, mask=None):
-        return self.base_model(inputs)
-
-    def compute_loss(self, x, y, sample_weights, training=False):
-        y_pred = self(x, training)
-        _, potentials, sequence_length, chain_kernel = y_pred
-        crf_loss = -1 * crf_log_likelihood(potentials, y, sequence_length, chain_kernel)[0]
-        if sample_weights is not None:
-            crf_loss = crf_loss * sample_weights
-
-        return tf.reduce_mean(crf_loss), sum(self.losses)
-
-    def train_step(self, data):
-        x, y, sample_weights = get_data(data)
-        with tf.GradientTape() as tape:
-            crf_loss, internal_losses = self.compute_loss(
-                x, y, sample_weights, training=True
-            )
-            total_loss = crf_loss + internal_losses
-
-        gradients = tape.gradient(total_loss, self.trainable_weights)
-        self.optimizer.apply_gradients(zip(gradients, self.trainable_weights))
-        # 更新权重参数到模型上
-
-    def test_step(self, data):
-        x, y, sample_weights = get_data(data)
-        crf_loss, internal_losses = self.compute_loss(
-            x, y, sample_weights, training=False
-        )
-        return {"crf_loss_val": crf_loss, "internal_losses_val": internal_losses}
-
-
-x_np, y_np = [None, None]
-
-x_input = tf.keras.layers.Input(shape=x_np.shape[1:])
-crf_outputs = tfa.layers.CRF(5)(x_input)
-base_model = tf.keras.Model(x_input, crf_outputs)
-model = CrfLossModel(base_model)
-
-model.compile("adam")
-model.fit(x=x_np, y=y_np)
-model.evaluate(x_np, y_np)
-model.predict(x_np)
-model.save("my_model.tf")
+def bert_build():
+    bert = build_transformer_model(
+        config_path=config_path,
+        checkpoint_path=model_path,
+        model='bert'
+    )
+    hidden = bert.model.output
+    dropout = tf.keras.layers.Dropout(0.3)(hidden)
+    dense = tf.keras.layers.Dense(num_class,
+                                  activation='softmax',
+                                  kernel_initializer=bert.initializer
+                                  )(dropout)
+    model = tf.keras.Model()
