@@ -1,6 +1,7 @@
 # *- coding: utf-8 -*
 
 import codecs
+import re
 import warnings
 
 import numpy as np
@@ -11,6 +12,7 @@ import tensorflow_addons as tfa
 from transformers import BertTokenizer, TFBertModel
 from sklearn.model_selection import train_test_split
 
+pd.set_option('display.max_columns', None)
 
 warnings.filterwarnings("ignore")
 
@@ -73,7 +75,7 @@ def labels4seq(data, id2seq=False):
             'O': 1, 'I-LOC': 2, 'B-LOC': 3, 'I-ORG': 4, 'B-ORG': 5, 'B-PER': 6, 'I-PER': 7}
     else:
         label_seq = {
-            1: 'O', 2: 'I-LOC', 3: 'B-LOC', 4: 'I-ORG', 5: 'B-ORG', 6: 'B-PER', 7: 'I-PER'}
+            '1': 'O', '2': 'I-LOC', '3': 'B-LOC', '4': 'I-ORG', '5': 'B-ORG', '6': 'B-PER', '7': 'I-PER', '0': ''}
 
     label = [label_seq[i] for i in data]
 
@@ -81,7 +83,7 @@ def labels4seq(data, id2seq=False):
 
 
 def dataset_generator(data):
-    ids, masks, tokens, labels = [], [], [], []
+    ids, masks, tokens, labels, labels_length = [], [], [], [], []
 
     data = data.sample(frac=1.0)
 
@@ -97,6 +99,8 @@ def dataset_generator(data):
         input_id = inputs['input_ids']
         input_mask = inputs['attention_mask']
         token_type_ids = inputs["token_type_ids"]
+        label_length = len(d['label'])
+        # 加入label_length的目的仅限于后续将content, label和predict值切分出来，在训练过程中不涉及
 
         label = labels4seq(d['label'])
         label = label + (max_len - len(label)) * [0]
@@ -105,6 +109,7 @@ def dataset_generator(data):
         masks.append(input_mask)
         tokens.append(token_type_ids)
         labels.append(label)
+        labels_length.append([label_length])
 
         if len(ids) == batch_size or _ == len(data):
             yield {
@@ -112,8 +117,9 @@ def dataset_generator(data):
                 'masks': tf.constant(masks, dtype=tf.int32),
                 'tokens': tf.constant(tokens, dtype=tf.int32),
                 'labels': tf.constant(labels, dtype=tf.int32),
+                'labels_length': tf.constant(labels_length, dtype=tf.int32)
             }
-            ids, masks, tokens, labels = [], [], [], []
+            ids, masks, tokens, labels, labels_length = [], [], [], [], []
 
 
 def get_dataset():
@@ -233,47 +239,126 @@ def start(dataset, use_crf, input_dim, output_dim, fit=True):
 
     if fit:
         # fit
-        for epoch in range(epochs + 1):
-            for _, data in enumerate(dataset):
-                loss, predict, labels = fit_models(batch_data=data)
-                if _ % 5 == 0:
-                    print(f"epoch: {epoch}, step: {_}, loss_value: {loss}")
-                if _ % 200 == 0:
-                    print(f"predict: {predict[0]}, target: {labels[0]}")
-            checkpoint_manager.save()
+        for _, data in enumerate(dataset):
+            loss, predict, labels = fit_models(batch_data=data)
+            if _ % 5 == 0:
+                print(f"step: {_}, loss_value: {loss}")
+            if _ % 200 == 0:
+                print(f"predict: {predict[0]}, target: {labels[0]}, ids: {data['ids'][0]}")
+        checkpoint_manager.save()
+
+        return None
     else:
         # valid
+        valid_pre_label = pd.DataFrame()
         checkpoint.restore(tf.train.latest_checkpoint('model_save/bert_crf_checkpoint'))
         for _, inputs in enumerate(dataset):
+            mid = pd.DataFrame()
             valid_id = inputs['ids']
             valid_mask = inputs['masks']
-            valid_token = inputs["tokens"]
+            valid_token = inputs['tokens']
             valid_target = inputs['labels']
+            valid_target_length = inputs['labels_length']
             valid_seq_len = tf.reduce_sum(valid_mask, axis=1)
 
             valid_pred, _, _ = bert_crf(valid_id, valid_mask, valid_token, valid_target, valid_seq_len)
-            print("valid: ", valid_pred[0])
-            print("target: ", valid_target[0])
-            print("step: ", _)
+            valid_pred = pd.DataFrame(np.array(valid_pred), dtype=str)
+
+            valid_pred['pre'] = valid_pred[valid_pred.columns].apply(
+                lambda x: list(x), axis=1
+            )
+
+            valid_target = pd.DataFrame(np.array(valid_target), dtype=str)
+            valid_target['label'] = valid_target[valid_target.columns].apply(
+                lambda x: list(x), axis=1
+            )
+
+            valid_id = pd.DataFrame(np.array(valid_id), dtype=str)
+            valid_id['ids'] = valid_id[valid_id.columns].apply(
+                lambda x: list(x), axis=1
+            )
+
+            mid['length'] = pd.DataFrame(np.array(valid_target_length), columns=['label_length'])['label_length']
+            mid['label'] = valid_target['label']
+            mid['pre'] = valid_pred['pre']
+            mid['ids'] = valid_id['ids']
+
+            valid_pre_label = pd.concat([valid_pre_label, mid])
+
+        return valid_pre_label
 
 
 # 训练一个epoch是46m
 train_path = '../dataset/train_dataset.xlsx'
 valid_path = '../dataset/valid_dataset.xlsx'
 
-train_dataset = pd.read_excel(train_path, usecols=['content', 'label'])
-valid_dataset = pd.read_excel(valid_path, usecols=['content', 'label'])
-valid_dataset['content'] = valid_dataset['content'].apply(
-    lambda x: x.split('|')
-)
-valid_dataset['label'] = valid_dataset['label'].apply(
-    lambda x: x.split('|')
-)
-train_dataset['content'] = train_dataset['content'].apply(
-    lambda x: x.split('|')
-)
-train_dataset['label'] = train_dataset['label'].apply(
-    lambda x: x.split('|')
-)
-start(dataset=train_dataset, use_crf=True, input_dim=vocab_size, output_dim=num_class, fit=True)
-# start(dataset=valid_dataset, use_crf=True, input_dim=vocab_size, output_dim=num_class, fit=False)
+def fit_model():
+    train_dataset = pd.read_excel(train_path, usecols=['content', 'label'])
+
+    train_dataset['content'] = train_dataset['content'].apply(
+        lambda x: x.split('|')
+    )
+    train_dataset['label'] = train_dataset['label'].apply(
+        lambda x: x.split('|')
+    )
+    start(dataset=train_dataset, use_crf=True, input_dim=vocab_size, output_dim=num_class, fit=True)
+
+
+def valid_model():
+    valid_dataset = pd.read_excel(valid_path, usecols=['content', 'label'])
+
+    valid_dataset['content'] = valid_dataset['content'].apply(
+        lambda x: x.split('|')
+    )
+
+    valid_dataset['label'] = valid_dataset['label'].apply(
+        lambda x: x.split('|')
+    )
+
+    valid = start(dataset=valid_dataset, use_crf=True, input_dim=vocab_size, output_dim=num_class, fit=False)
+    valid.dropna(inplace=True)
+
+    def get_real_content(data, length):
+        return data[1:1 + length]
+
+    valid['content'] = valid.apply(
+        lambda x: get_real_content(x['ids'], x['length']), axis=1
+    )
+
+    def get_real_label_pre(data, length):
+        return data[:length]
+
+    valid['label'] = valid.apply(
+        lambda x: get_real_label_pre(x['label'], x['length']), axis=1
+    )
+
+    valid['pre'] = valid.apply(
+        lambda x: get_real_label_pre(x['pre'], x['length']), axis=1
+    )
+
+    print(valid)
+
+    valid.to_excel('../dataset/valid.xlsx')
+
+def get_f1score():
+    valid = pd.read_excel('../dataset/valid.xlsx', usecols=['label', 'pre'])
+
+    valid['label'] = valid['label'].apply(
+        lambda x: re.findall(pattern='[0-9]', string=x)
+    )
+    valid['pre'] = valid['pre'].apply(
+        lambda x: re.findall(pattern='[0-9]', string=x)
+    )
+
+    from sklearn.metrics import f1_score
+
+    def f1score(t, p):
+        t = np.array(t)
+        p = np.array(p)
+        return f1_score(y_true=t, y_pred=p, average="macro")
+
+    valid['score'] = valid.apply(
+        lambda x: f1score(x['label'], x['pre']), axis=1
+    )
+
+    print(valid['score'].mean())
