@@ -2,31 +2,10 @@
 <project version="4">
   <component name="PublishConfigData" autoUpload="Always" serverName="airx@192.168.0.131:22" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
-      <paths name="air@192.168.0.38:22">
-        <serverdata>
-          <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="air@192.168.0.38:22 (1)">
-        <serverdata>
-          <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
       <paths name="airx@192.168.0.131:22">
         <serverdata>
           <mappings>
-            <mapping deploy="/mnt/tang_nlp" local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="airx@192.168.0.131:22 (1)">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/mnt/tang_nlp" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/mnt/tang_nlp" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>

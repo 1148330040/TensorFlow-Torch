@@ -4,3 +4,6 @@ seq2seq_project/seq2seq_tf2.2/seq2seq_config.json
 crf_project/dataset/*
 pretrain_models/*
 
+crf_project/crf_tf2.2/test.py
+seq2seq_project/seq2seq_tf2.2/test.py
+seq2seq_project/seq2seq_tf2.2/test.txt
