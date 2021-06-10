@@ -2,6 +2,7 @@
 
 
 import codecs
+import json
 import re
 import warnings
 
@@ -36,6 +37,7 @@ tokenizer = BertTokenizer.from_pretrained("hfl/chinese-bert-wwm-ext")
 vocab_size = len(tokenizer.get_vocab())
 
 num_class = len(['O', 'I-LOC', 'B-LOC', 'I-ORG', 'B-ORG', 'B-PER', 'I-PER']) + 1
+log_dir = f'model_save/logs/'
 
 
 def load_iob2(file_path):
@@ -188,6 +190,20 @@ def get_loss_2(t, p):
     return loss_value
 
 
+def get_f1_score(labels, predicts, use_crf):
+
+    if not use_crf:
+        predicts = tf.argmax(predicts, axis=-1)
+
+    labels = np.array(labels)
+    predicts = np.array(predicts)
+    l_p = zip(labels, predicts)
+
+    f1_value = np.array([f1_score(y_true=l, y_pred=p, average="macro") for l, p in l_p]).mean()
+
+    return f1_value
+
+
 def start(dataset, use_crf, input_dim, output_dim, fit=True):
     # bert层的学习率与其他层的学习率要区分开来
     dataset = dataset_generator(dataset)
@@ -255,61 +271,56 @@ def start(dataset, use_crf, input_dim, output_dim, fit=True):
     if fit:
         # fit
         for _, data in enumerate(dataset):
-            loss, predict, labels = fit_models(batch_data=data)
+            loss, predicts, labels = fit_models(batch_data=data)
             if _ % 5 == 0:
                 print(f"step: {_}, loss_value: {loss}")
             if _ % 20 == 0:
-                print(f"predict: {tf.argmax(predict, axis=-1)[0]}, target: {labels[0]}, ids: {data['ids'][0]}")
+                f1_value = get_f1_score(labels=labels, predicts=predicts, use_crf=use_crf)
+                with open(log_dir + 'fit_logs.txt', 'a') as f:
+                    # 'a' 要求写入字符
+                    # 'wb' 要求写入字节(str.encode(str))
+                    log = f"step: {_}, loss{loss}, f1_score: {f1_value} \n"
+                    f.write(log)
+
         checkpoint_manager.save()
 
-        return None
     else:
         # valid
-        valid_pre_label = pd.DataFrame()
         checkpoint.restore(tf.train.latest_checkpoint('model_save/bert_crf_checkpoint'))
-        for _, inputs in enumerate(dataset):
-            mid = pd.DataFrame()
+
+        valid_fi_score_all = []
+
+        for num, inputs in enumerate(dataset):
             valid_id = inputs['ids']
             valid_mask = inputs['masks']
             valid_token = inputs['tokens']
             valid_target = inputs['labels']
-            valid_target_length = inputs['labels_length']
             valid_seq_len = tf.reduce_sum(valid_mask, axis=1)
 
             valid_pred, _, _ = bert_crf(valid_id, valid_mask, valid_token, valid_target, valid_seq_len)
 
-            if not use_crf:
-                valid_pred = tf.argmax(valid_pred, axis=-1)
+            f1_value = get_f1_score(labels=valid_target, predicts=valid_pred, use_crf=use_crf)
 
-            valid_pred = pd.DataFrame(np.array(valid_pred), dtype=str)
+            valid_fi_score_all.append(f1_value)
 
-            valid_pred['pre'] = valid_pred[valid_pred.columns].apply(
-                lambda x: list(x), axis=1
-            )
+            with open(log_dir + 'valid_logs.txt', 'a') as f:
+                # 'a' 要求写入字符
+                # 'wb' 要求写入字节(str.encode(str))
+                log = f"batch: {num}, f1_score: {f1_value} \n"
+                f.write(log)
 
-            valid_target = pd.DataFrame(np.array(valid_target), dtype=str)
-            valid_target['label'] = valid_target[valid_target.columns].apply(
-                lambda x: list(x), axis=1
-            )
+            if num % 10 == 0:
+                print(f"step: {num}, valid_pred: {valid_pred}")
+                print(f"step: {num}, valid_target: {valid_target}")
+                print(f"step: {num}, f1_score: {f1_score}")
 
-            valid_id = pd.DataFrame(np.array(valid_id), dtype=str)
-            valid_id['ids'] = valid_id[valid_id.columns].apply(
-                lambda x: list(x), axis=1
-            )
-
-            mid['length'] = pd.DataFrame(np.array(valid_target_length), columns=['label_length'])['label_length']
-            mid['label'] = valid_target['label']
-            mid['pre'] = valid_pred['pre']
-            mid['ids'] = valid_id['ids']
-
-            valid_pre_label = pd.concat([valid_pre_label, mid])
-
-        return valid_pre_label
+        return valid_fi_score_all
 
 
 # 训练一个epoch是46m
 train_path = '../dataset/train_dataset.xlsx'
 valid_path = '../dataset/valid_dataset.xlsx'
+
 
 def fit_model():
     train_dataset = pd.read_excel(train_path, usecols=['content', 'label'])
@@ -334,48 +345,5 @@ def valid_model():
         lambda x: x.split('|')
     )
 
-    valid = start(dataset=valid_dataset, use_crf=True, input_dim=vocab_size, output_dim=num_class, fit=False)
+    start(dataset=valid_dataset, use_crf=True, input_dim=vocab_size, output_dim=num_class, fit=False)
 
-    valid.dropna(inplace=True)
-
-    def get_real_content(data, length):
-        return data[1:1 + length]
-
-    valid['content'] = valid.apply(
-        lambda x: get_real_content(x['ids'], x['length']), axis=1
-    )
-
-    def get_real_label_pre(data, length):
-        return data[:length]
-
-    valid['label'] = valid.apply(
-        lambda x: get_real_label_pre(x['label'], x['length']), axis=1
-    )
-
-    valid['pre'] = valid.apply(
-        lambda x: get_real_label_pre(x['pre'], x['length']), axis=1
-    )
-
-    valid.to_excel('../dataset/valid_bert.xlsx')
-
-
-def get_f1score():
-    valid = pd.read_excel('../dataset/valid_bert.xlsx', usecols=['label', 'pre'])
-
-    valid['label'] = valid['label'].apply(
-        lambda x: re.findall(pattern='[0-9]', string=x)
-    )
-    valid['pre'] = valid['pre'].apply(
-        lambda x: re.findall(pattern='[0-9]', string=x)
-    )
-
-    def f1score(t, p):
-        t = np.array(t)
-        p = np.array(p)
-        return f1_score(y_true=t, y_pred=p, average="macro")
-
-    valid['score'] = valid.apply(
-        lambda x: f1score(x['label'], x['pre']), axis=1
-    )
-
-    print(valid['score'].mean())
