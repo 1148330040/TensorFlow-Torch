@@ -97,7 +97,7 @@ def dataset_generator(data):
         inputs = tokenizer.encode_plus(content,
                                        add_special_tokens=True,
                                        max_length=max_len,
-                                       pad_to_max_length=True,
+                                       padding='max_length',
                                        return_token_type_ids=True)
 
         input_id = inputs['input_ids']
@@ -274,6 +274,7 @@ def start(dataset, use_crf, input_dim, output_dim, fit=True):
             loss, predicts, labels = fit_models(batch_data=data)
             if _ % 5 == 0:
                 print(f"step: {_}, loss_value: {loss}")
+
             if _ % 20 == 0:
                 f1_value = get_f1_score(labels=labels, predicts=predicts, use_crf=use_crf)
                 with open(log_dir + 'fit_logs.txt', 'a') as f:
@@ -347,3 +348,48 @@ def valid_model():
 
     start(dataset=valid_dataset, use_crf=True, input_dim=vocab_size, output_dim=num_class, fit=False)
 
+
+def predict(content, crf=True):
+    """
+    用于处理对话中的单条语句
+    """
+    inputs = tokenizer.encode_plus(content,
+                                   add_special_tokens=True,
+                                   max_length=max_len,
+                                   padding='max_length',
+                                   return_token_type_ids=True)
+
+    input_id = tf.constant([inputs['input_ids']])
+    input_mask = tf.constant([inputs['attention_mask']])
+    token_type_ids = tf.constant([inputs["token_type_ids"]])
+
+    label_length = len(content)
+    label = tf.constant([max_len * [0]])
+    input_seq_len = tf.reduce_sum(input_mask, axis=1)
+
+    bert_crf = MyBertCrf(use_crf=crf, input_dim=vocab_size, output_dim=num_class)
+    checkpoint = tf.train.Checkpoint(model=bert_crf)
+
+    if crf:
+        model_ckpt_path = 'model_save/bert_crf_checkpoint'
+    else:
+        model_ckpt_path = 'model_save/bert_checkpoint'
+
+    checkpoint.restore(tf.train.latest_checkpoint(model_ckpt_path))
+
+    predict_label, _, _ = bert_crf(input_id, input_mask, token_type_ids, label, input_seq_len)
+    if not crf:
+        predict_label = tf.argmax(predict_label, axis=-1)
+
+    # 只提取keywords的编码
+    predict_label = np.array(predict_label)[0][:label_length]
+    predict_label_mask = [0 if p <= 1 else 1 for p in predict_label]
+
+    # 根据keywords的编码获取input_id内部的关键词id
+    input_id_mask = np.array(input_id)[0][1: label_length + 1]
+    keywords_id = predict_label_mask * input_id_mask
+    keywords = tokenizer.decode(keywords_id)
+
+    # 将会根据关键词内部的id和预测值的关键词编码获取到对应槽的值
+
+    return keywords, predict_label
