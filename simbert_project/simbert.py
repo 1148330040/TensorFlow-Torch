@@ -1,11 +1,5 @@
 # *- coding: utf-8 -*-
 
-# =================================
-# time: 2021.4.9
-# author: @唐志林
-# function: 处理title和desc连接后的句子
-# =================================
-
 import os
 import numpy as np
 import pandas as pd
