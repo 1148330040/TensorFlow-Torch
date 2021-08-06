@@ -8,6 +8,7 @@ crf_project/crf_tf2.2/test.py
 
 seq2seq_project/seq2seq_tf2.2/test.py
 seq2seq_project/seq2seq_tf2.2/test.txt
+seq2seq_project/seq2seq_tf2.2/seq2seq_test.py
 knowledge_graph_project/dataset/*
 knowledge_graph_project/demo_test/*
 
