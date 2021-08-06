@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-from py2neo import Node, Graph, Relationship, NodeMatcher
+from py2neo import Node, Graph, Relationship
 
 graph = Graph("http://192.168.0.140:7474", auth=("neo4j", "123456"))
 
@@ -10,9 +10,9 @@ node2_name = '问题类型'
 node3_name = '工艺类型'
 node4_name = '工艺'
 
-dataset = pd.read_excel('ds55.xls')
+dataset = pd.read_excel('../dataset/ds55.xls')
 dataset.pop('answer')
-
+print(dataset)
 
 def get_nodes():
     """获取node值的两个标准:
@@ -116,9 +116,10 @@ def delete_node(dell_all=False, del_name=None):
         graph.run(cypher=f'match (n) where n.name = {del_name} detach delete n')
 
 
-nodes_data = get_nodes()
-print(dataset)
+# nodes_data = get_nodes()
+# print(dataset)
 # print(nodes_data)
 # creat_nodes(nodes_data)
 # triple4data = get_triple4data()
 # create_relation(triple4data)
+delete_node(True)
