@@ -143,9 +143,9 @@ def data_generator(dataset):
             # 1: 同时找到predicate和object
             # 2: 解决了一个输入可能存在多组三元组关系数据
 
-            subject_position_mask.append(mask4sub)
-            object_position_mask.append(mask4obj)
-            position_predict.append(sub_obj_predicate)
+        subject_position_mask.append(mask4sub)
+        object_position_mask.append(mask4obj)
+        position_predict.append(sub_obj_predicate)
 
         if len(ids) == batch_size or _ == len(dataset):
             yield {
@@ -160,63 +160,62 @@ def data_generator(dataset):
             subject_position_mask, object_position_mask, position_predict = [], [], []
 
 
-# data = data_generator(spo_dataset)
-# example_data = next(iter(data))
-#
-# positions = example_data['position_predict']
-# position_start = np.array([[pos[0][0][0]] for pos in positions])
-# position_end = np.array([[pos[0][0][1]] for pos in positions])
-#
-# model = TFBertModel.from_pretrained('hfl/chinese-bert-wwm-ext')
-# dropout = tf.keras.layers.Dropout(0.3)
-# dense = tf.keras.layers.Dense(2)
-# other_params = tf.Variable(tf.random.uniform(shape=(2, 2)))
-#
-# ids = example_data['ids']
-# masks = example_data['masks']
-# tokens = example_data['tokens']
-# target = example_data['subject_position_mask']
-#
-# input_seq_len = tf.cast(tf.reduce_sum(masks, axis=1), dtype=tf.int32)
+data = data_generator(spo_dataset)
+example_data = next(iter(data))
+
+positions = example_data['position_predict']
+position_start = np.array([[pos[0][0][0]] for pos in positions])
+position_end = np.array([[pos[0][0][1]] for pos in positions])
+
+model = TFBertModel.from_pretrained('hfl/chinese-bert-wwm-ext')
+dropout = tf.keras.layers.Dropout(0.3)
+dense = tf.keras.layers.Dense(2)
+other_params = tf.Variable(tf.random.uniform(shape=(2, 2)))
+
+ids = example_data['ids']
+masks = example_data['masks']
+tokens = example_data['tokens']
+target = example_data['subject_position_mask']
+
+input_seq_len = tf.cast(tf.reduce_sum(masks, axis=1), dtype=tf.int32)
 
 # for var in model.trainable_weights:
 #     print(var.name)
 # print(model.trainable_weights[-5])
 
-# hidden = model(ids, masks, tokens)[0]
-#
-#
-# hidden_drop = dropout(hidden, 1)
-# logistic_seq = dense(hidden_drop)
-# logistic_seq = tf.keras.layers.Lambda(lambda x: x**2)(logistic_seq)
-#
-#
-# log_likelihood, other_params = tfa.text.crf.crf_log_likelihood(logistic_seq,
-#                                                                target,
-#                                                                input_seq_len,
-#                                                                other_params)
-# decode_predict, _ = tfa.text.crf_decode(logistic_seq, other_params , input_seq_len)
+hidden = model(ids, masks, tokens)[0]
 
 
-# layer_normal = tf.keras.layers.LayerNormalization()
-# dense = tf.keras.layers.Dense(len(predicate2id)*2,
-#                               activation='sigmoid',
-#                               kernel_initializer=tf.initializers.TruncatedNormal(stddev=0.02))
-# weights = model.trainable_weights[-5]
-# start = tf.gather(weights, position_start)
-# end = tf.gather(weights, position_end)
-# new_hidden = tf.keras.layers.concatenate(inputs=[start, end], axis=-1)
-# reshape = tf.keras.layers.Reshape((-1, len(predicate2id), 2))
-# normal = layer_normal(new_hidden)
-# out = dense(normal)
-# print(reshape(out))
+hidden_drop = dropout(hidden, 1)
+logistic_seq = dense(hidden_drop)
+logistic_seq = tf.keras.layers.Lambda(lambda x: x**2)(logistic_seq)
 
-class BertCrf4Sub(tf.keras.Model):
+log_likelihood, other_params = tfa.text.crf.crf_log_likelihood(logistic_seq,
+                                                               target,
+                                                               input_seq_len,
+                                                               other_params)
+decode_predict, _ = tfa.text.crf_decode(logistic_seq, other_params , input_seq_len)
+
+
+layer_normal = tf.keras.layers.LayerNormalization()
+dense = tf.keras.layers.Dense(len(predicate2id)*2,
+                              activation='sigmoid',
+                              kernel_initializer=tf.initializers.TruncatedNormal(stddev=0.02))
+weights = model.trainable_weights[-5]
+start = tf.gather(weights, position_start)
+end = tf.gather(weights, position_end)
+new_hidden = tf.keras.layers.concatenate(inputs=[start, end], axis=-1)
+reshape = tf.keras.layers.Reshape((-1, len(predicate2id), 2))
+normal = layer_normal(new_hidden)
+out = dense(normal)
+print(reshape(out))
+
+class BertModelCrf4Sub(tf.keras.Model):
     """该类用以获取subject
     使用bert&crf模型, 以序列标注的方法进行训练
     """
     def __init__(self, output_dim):
-        super(BertCrf4Sub, self).__init__(output_dim)
+        super(BertModelCrf4Sub, self).__init__(output_dim)
         # 如果使用embedding需要用到此参数, input_dim=len(vocabs)
         self.output_dim = output_dim
 
@@ -247,11 +246,11 @@ class BertCrf4Sub(tf.keras.Model):
         return sub_predict, self.bert.trainable_weights[-5], log_likelihood
 
 
-class Bert4Obj(tf.keras.Model):
-    """该类用以获取obj
+class Model4Obj(tf.keras.Model):
+    """该类用以获取object
     """
     def __init__(self, output_dim):
-        super(Bert4Obj, self).__init__(output_dim)
+        super(Model4Obj, self).__init__(output_dim)
         self.dense = tf.keras.layers.Dense(output_dim,
                                            activation='sigmoid',
                                            kernel_initializer=tf.initializers.TruncatedNormal(stddev=0.02))
@@ -266,6 +265,23 @@ class Bert4Obj(tf.keras.Model):
         obj_predict = tf.keras.layers.Lambda(lambda x: x**4)(obj_predict)
         obj_predict = tf.keras.layers.Reshape((-1, len(predicate2id), 2))(obj_predict)
         return obj_predict
+
+
+class Model4Pre(tf.keras.Model):
+    """该类用以获取predicate
+    如果predicate是固定的话，那么可以使用分类模型
+    如果predicate不是固定的话，那么可以使用seq2seq文本生成模型
+    """
+    def __init__(self, pre_sorts):
+        super(Model4Pre, self).__init__(pre_sorts)
+        self.output_dims = pre_sorts
+        self.dense = tf.keras.layers.Dense(units=self.output_dims)
+
+    @tf.function
+    def call(self, inputs):
+        trainable_weights = inputs
+
+
 
 
 def concatenate_weights(trainable_weight, positions):
@@ -296,7 +312,7 @@ def loss4sub(t, p):
 def fit_step(dataset, fit=True):
     dataset = data_generator(dataset)
 
-    model_sub = BertCrf4Sub(2)
+    model_sub = BertModelCrf4Sub(2)
     opti_bert_sub = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.9, beta_2=0.95)
     opti_other_sub = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.9, beta_2=0.95)
 
