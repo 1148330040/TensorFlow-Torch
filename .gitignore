@@ -13,3 +13,4 @@ knowledge_graph_project/dataset/*
 knowledge_graph_project/demo_test/*
 
 information_extraction/dataset/*
+information_extraction/test.py
