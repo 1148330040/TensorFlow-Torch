@@ -91,6 +91,7 @@ def get_predict_vocab(dataset):
 
 
 spo_dataset = get_dataset(path=relation_ext_path)
+valid_dataset = get_dataset(path=valid_ds_path)
 predicate2id, id2predicate = get_predict_vocab(spo_dataset)
 batch_size = 25
 
@@ -105,7 +106,7 @@ def data_generator(dataset):
     """
     ids, masks, tokens = [], [], []
     subject_labels, object_labels, predicate_labels, positions = [], [], [], []
-    dataset = dataset.sample(frac=0.8)
+    dataset = dataset.sample(frac=1.0)
     for _, ds in dataset.iterrows():
         text = ''.join(ds['text'])
         spo_lists = ds['spo_list']
@@ -119,6 +120,9 @@ def data_generator(dataset):
         input_id = inputs['input_ids']
         attention_mask = inputs['attention_mask']
         token_type_ids = inputs['token_type_ids']
+
+        if len(input_id) > max_len:
+            continue
 
         mask4sub = np.zeros((len(text)), dtype=np.int32)
         mask4obj = np.zeros((len(text)), dtype=np.int32)
@@ -185,6 +189,7 @@ def data_generator(dataset):
             tokens.append(token_type_ids[:max_len])
         else:
             continue
+
         if len(ids) == batch_size or _ == len(dataset):
             yield {
                 'input_ids': tf.constant(ids, dtype=tf.int32),
@@ -472,6 +477,19 @@ class Model4Pre(tf.keras.Model):
         return predict
 
 
+
+model_sub = ModelBertCrf4Sub(output_dim=2, use_crf=True)
+opti_bert_sub = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.9, beta_2=0.95)
+opti_other_sub = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.9, beta_2=0.95)
+
+model_obj = ModelCrf4Obj(output_dim=2, use_crf=True)
+opti_obj = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.9, beta_2=0.95)
+
+# 此处predicate种类是确定的因此作为分类模型考虑
+model_pre = Model4Pre(len(predicate2id))
+opti_pre = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.9, beta_2=0.95)
+
+
 def loss4sub_obj_crf(log):
     loss = -tf.reduce_mean(log)
 
@@ -566,7 +584,7 @@ def get_predict_data(content):
     return input_id, input_mask, token_type_ids, label
 
 
-def predict(content, models):
+def predict(content):
     """预测函数, 步骤如下：
     1: 预测subject
     2: 获取预测到的subject对应的位置信息, 并以此拆分判断预测到了几个subject
@@ -577,7 +595,6 @@ def predict(content, models):
     input_id, input_mask, token_type_ids, label = get_predict_data(content=content)
 
     # 需要以全局变量的形式出现
-    model_sub, model_obj, model_pre = models
 
     def get_positions(value):
         position = []
@@ -616,6 +633,7 @@ def predict(content, models):
 
             if len(positions_obj) == 0:
                 continue
+
             for pos_obj in positions_obj:
                 pos_sub_obj = [pos_sub, pos_obj]
 
@@ -628,41 +646,43 @@ def predict(content, models):
                 predicate = np.where(predicate > 0)[0]
                 if len(predicate) == 0:
                     continue
+
                 predicate = predicate[0]
+                if pos_sub[-1] >= 127 or pos_obj[-1] >= 127:
+                    all_spo.append(([]))
+                else:
+                    all_spo.append(([pos_sub[0], pos_sub[1]],
+                                    predicate,
+                                    [pos_obj[0], pos_obj[1]]))
 
-                all_spo.append(([pos_sub[0], pos_sub[1]],
-                                predicate,
-                                [pos_obj[0], pos_obj[1]]))
-
-        all_spo = [(content[s[0]:(s[1] + 1)],
-                    id2predicate[p],
-                    content[o[0]:(o[1] + 1)]) for s, p, o in all_spo]
+        all_spo = [(content[spo[0][0]:(spo[0][1] + 1)],
+                    id2predicate[spo[1]],
+                    content[spo[2][0]:(spo[2][1] + 1)]) if len(spo) > 0 else () for spo in all_spo]
 
     return all_spo
 
 
-def evaluate(path, models):
+def evaluate():
     """"""
-    dataset = open(path)
-
     len_lab = 1e-10
     len_pre = 1e-10
     len_pre_is_true = 1e-10
+    num = 0
+    val_dataset = valid_dataset
 
-    for ds in dataset.readlines():
-        ds = json.loads(ds)
+    for _, ds in val_dataset.iterrows():
         text = ds['text']
-        if len(text) > 126:
-            continue
 
         spo_t = ds['spo_list']
         spo_labels = set([(spo['subject'], spo['predicate'], spo['object']['@value']) for spo in spo_t])
-        predict(content=text, models=models)
-        spo_predicts = set(predict(content=text, models=models))
-
+        spo_predicts = set(predict(content=text))
         len_lab += len(spo_labels)
         len_pre += len(spo_predicts)
         len_pre_is_true += len(spo_labels & spo_predicts)
+        num += 1
+        if num % 200==0:
+            print(spo_predicts)
+            print(spo_labels)
         # & 该运算的作用是返回两个输入内部相同的值
         # a: [(1, 2), (3, 4), (5, 6)],  b: [(3, 4), (1, 2), (6, 5)]
         # 返回 [(1, 2), (3, 4)]
@@ -675,18 +695,6 @@ def evaluate(path, models):
 
 
 def fit_step():
-    # dataset = data_generator(dataset)
-    model_sub = ModelBertCrf4Sub(output_dim=2, use_crf=True)
-    opti_bert_sub = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.9, beta_2=0.95)
-    opti_other_sub = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.9, beta_2=0.95)
-
-    model_obj = ModelCrf4Obj(output_dim=2, use_crf=True)
-    opti_obj = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.9, beta_2=0.95)
-
-    # 此处predicate种类是确定的因此作为分类模型考虑
-    model_pre = Model4Pre(len(predicate2id))
-    opti_pre = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.9, beta_2=0.95)
-
 
     def fit_models(inputs_model, inputs_labels, inputs_other):
         positions_sub, positions_obj = inputs_other
@@ -754,9 +762,9 @@ def fit_step():
         # predict: 预测获取的sub, weights: inputs的bert编码层feed&forward层向量
         return predict_sub, predict_obj, predict_pre, loss_sub, loss_obj, loss_pre
 
-    f1_value_mid, precision_mid, recall_mid = 0, 0, 0
+    f1_value_mid, precision_mid, recall_mid = 0.370280600354258, 0.4655414908579591, 0.30738275808699417
 
-    for num in range(1, 5):
+    for num in range(2, 15):
         dataset = data_generator(spo_dataset)
         for _, data in enumerate(dataset):
             ids = data['input_ids']
@@ -794,7 +802,12 @@ def fit_step():
                 print(f"pre_predict: {tf.argmax(p_pre[0], axis=1)}")
                 print(f"pre_labels : {tf.argmax(pre_labels[0], axis=1)}")
 
-        f1_value, precision, recall = evaluate(valid_ds_path, [model_sub, model_obj, model_pre])
+        model_sub.save(model_sub_path+'current/' + str(num) + '/n')
+        model_obj.save(model_obj_path+'current/' + str(num) + '/n')
+        model_pre.save(model_pre_path+'current/' + str(num) + '/n')
+
+        f1_value, precision, recall = evaluate()
+
         with open('models_save/fit_logs.txt', 'a') as f:
             f.write(f"第{num}轮训练结束后, f1_value: {f1_value}, precision_value: {precision}, recall: {recall}")
 
@@ -806,7 +819,7 @@ def fit_step():
             with open('models_save/fit_logs.txt', 'a') as f:
                 f.write(f"当前最优模型在第{num}轮保存！")
 
-fit_step()
+# fit_step()
 
 
 
