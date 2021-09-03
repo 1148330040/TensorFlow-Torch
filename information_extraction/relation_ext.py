@@ -14,12 +14,14 @@ import pandas as pd
 
 import tensorflow as tf
 import tensorflow_addons as tfa
-from tensorflow import recompute_grad
+
 from tensorflow.keras import initializers, activations
 
 from datetime import datetime
 
 from transformers import BertTokenizer, TFBertModel
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 pd.set_option('display.max_columns', None)
 
@@ -335,14 +337,18 @@ class ModelBertCrf4Sub(tf.keras.Model):
     """该类用以获取subject
     使用bert&crf模型, 以序列标注的方法进行训练
     """
-
     def __init__(self, output_dim, use_crf, _=None):
+
         super(ModelBertCrf4Sub, self).__init__(output_dim, use_crf, _)
         self.use_crf = use_crf
         self.output_dim = output_dim
         self.bert = TFBertModel.from_pretrained('hfl/chinese-bert-wwm-ext')
         self.dropout = tf.keras.layers.Dropout(0.1)
-        self.dense = tf.keras.layers.Dense(self.output_dim)
+        self.dense = tf.keras.layers.Dense(self.output_dim,
+                                           activation='sigmoid')
+
+        self.lambdas = tf.keras.layers.Lambda(lambda x: x ** 2)
+
         self.other_params = tf.Variable(tf.random.uniform(shape=(self.output_dim, self.output_dim)))
 
 
@@ -361,7 +367,9 @@ class ModelBertCrf4Sub(tf.keras.Model):
 
         sub_predict = self.dense(dropout_inputs)
 
-        sub_predict = tf.keras.layers.Lambda(lambda x: x ** 2)(sub_predict)
+        sub_predict = self.lambdas(sub_predict)
+
+        log_likelihood = tf.constant(1)
 
         if self.use_crf:
             log_likelihood, self.other_params = tfa.text.crf.crf_log_likelihood(sub_predict,
@@ -372,8 +380,7 @@ class ModelBertCrf4Sub(tf.keras.Model):
 
             return decode_predict, hidden, log_likelihood
         else:
-            prob_seq = tf.nn.sigmoid(sub_predict)
-            return prob_seq, hidden, None
+            return sub_predict, hidden, log_likelihood
 
     def return_crf(self):
         return  self.use_crf
@@ -386,13 +393,16 @@ class ModelCrf4Obj(tf.keras.Model):
         super(ModelCrf4Obj, self).__init__(output_dim, use_crf, _)
         self.use_crf = use_crf
 
-        self.dense = tf.keras.layers.Dense(output_dim)
+        self.dense = tf.keras.layers.Dense(output_dim,
+                                           activation='sigmoid')
 
         self.layer_normal = LayerNormalization(conditional=True)
 
         self.dropout = tf.keras.layers.Dropout(0.1)
 
-        self.other_params = tf.Variable(tf.random.uniform(shape=(output_dim, output_dim)))
+        self.lambdas = tf.keras.layers.Lambda(lambda x: x**4)
+
+        # self.other_params = tf.Variable(tf.random.uniform(shape=(output_dim, output_dim)))
 
 
     @tf.function(input_signature=[(tf.TensorSpec([None, max_len, 768], name='hidden', dtype=tf.float32),
@@ -410,7 +420,9 @@ class ModelCrf4Obj(tf.keras.Model):
 
         obj_predict = self.dense(weights_obj)
 
-        obj_predict = tf.keras.layers.Lambda(lambda x: x**2)(obj_predict)
+        obj_predict = self.lambdas(obj_predict)
+
+        log_likelihood = tf.constant(1)
 
         if self.use_crf:
             log_likelihood, self.other_params = tfa.text.crf.crf_log_likelihood(obj_predict,
@@ -422,8 +434,8 @@ class ModelCrf4Obj(tf.keras.Model):
 
             return obj_predict, log_likelihood
         else:
-            obj_predict = tf.nn.sigmoid(obj_predict)
-            return obj_predict, None
+            return obj_predict, log_likelihood
+
 
     def return_crf(self):
         return self.use_crf
@@ -476,18 +488,6 @@ class Model4Pre(tf.keras.Model):
 
         return predict
 
-
-
-model_sub = ModelBertCrf4Sub(output_dim=2, use_crf=True)
-opti_bert_sub = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.9, beta_2=0.95)
-opti_other_sub = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.9, beta_2=0.95)
-
-model_obj = ModelCrf4Obj(output_dim=2, use_crf=True)
-opti_obj = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.9, beta_2=0.95)
-
-# 此处predicate种类是确定的因此作为分类模型考虑
-model_pre = Model4Pre(len(predicate2id))
-opti_pre = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.9, beta_2=0.95)
 
 
 def loss4sub_obj_crf(log):
@@ -592,6 +592,10 @@ def predict(content):
     4: 步骤同上获取object位置信息, 拆分, 按照每一组(subject, object)预测predicate, 并放入到spo列表中
     5: 整理spo列表传递到evaluate函数中"""
 
+    model_sub = tf.saved_model.load('models_save/model_sub/best_model/current_no_crf/12/')
+    model_obj = tf.saved_model.load('models_save/model_obj/best_model/current_no_crf/12/')
+    model_pre = tf.saved_model.load('models_save/model_pre/best_model/current_no_crf/12/')
+
     input_id, input_mask, token_type_ids, label = get_predict_data(content=content)
 
     # 需要以全局变量的形式出现
@@ -600,7 +604,7 @@ def predict(content):
         position = []
         positions = []
 
-        value = np.where(value[0] > 0)[0]
+        value = np.where(value > 0)[0]
         for i in value:
             if len(position) == 0:
                 position.append(i)
@@ -619,16 +623,20 @@ def predict(content):
 
     predict_sub, bert_hidden, _ = model_sub.call((input_id, input_mask, token_type_ids, label))
 
+    predict_sub = tf.argmax(predict_sub[0], axis=1)
+
     positions_sub = get_positions(predict_sub)
 
     all_spo = []
 
     if len(positions_sub) > 0:
         for pos_sub in positions_sub:
+            if len(pos_sub) == 1:
+                continue
             obj_weights = concatenate_weights_sub(bert_encoder_hidden=bert_hidden,
                                                   positions=pos_sub)
             predict_obj, _ = model_obj.call((bert_hidden, obj_weights, label, input_mask))
-
+            predict_obj = tf.argmax(predict_obj[0], axis=1)
             positions_obj = get_positions(predict_obj)
 
             if len(positions_obj) == 0:
@@ -654,7 +662,6 @@ def predict(content):
                     all_spo.append(([pos_sub[0], pos_sub[1]],
                                     predicate,
                                     [pos_obj[0], pos_obj[1]]))
-
         all_spo = [(content[spo[0][0]:(spo[0][1] + 1)],
                     id2predicate[spo[1]],
                     content[spo[2][0]:(spo[2][1] + 1)]) if len(spo) > 0 else () for spo in all_spo]
@@ -663,7 +670,7 @@ def predict(content):
 
 
 def evaluate():
-    """"""
+
     len_lab = 1e-10
     len_pre = 1e-10
     len_pre_is_true = 1e-10
@@ -672,15 +679,17 @@ def evaluate():
 
     for _, ds in val_dataset.iterrows():
         text = ds['text']
-
         spo_t = ds['spo_list']
         spo_labels = set([(spo['subject'], spo['predicate'], spo['object']['@value']) for spo in spo_t])
+
         spo_predicts = set(predict(content=text))
+
         len_lab += len(spo_labels)
         len_pre += len(spo_predicts)
         len_pre_is_true += len(spo_labels & spo_predicts)
         num += 1
         if num % 200==0:
+            print(text)
             print(spo_predicts)
             print(spo_labels)
         # & 该运算的作用是返回两个输入内部相同的值
@@ -693,8 +702,24 @@ def evaluate():
 
     return f1_value, precision, recall
 
-
+print(evaluate())
+# 2: 0.29
+# 5: 0.4078515565097396, 0.4050070049339118, 0.4107363479120354
+# 7: 0.41278370715632456, 0.39735932096825066, 0.42945391648134595
+# 8: 0.4177088087631236, 0.4115848174132056, 0.42401779095626563
+# 10: 0.4129040236192496, 0.4132809357304223, 0.41252779836916414
 def fit_step():
+
+    model_sub = ModelBertCrf4Sub(output_dim=2, use_crf=False)
+    opti_bert_sub = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.9, beta_2=0.95)
+    opti_other_sub = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.9, beta_2=0.95)
+
+    model_obj = ModelCrf4Obj(output_dim=2, use_crf=False)
+    opti_obj = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.9, beta_2=0.95)
+
+    # 此处predicate种类是确定的因此作为分类模型考虑
+    model_pre = Model4Pre(len(predicate2id))
+    opti_pre = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.9, beta_2=0.95)
 
     def fit_models(inputs_model, inputs_labels, inputs_other):
         positions_sub, positions_obj = inputs_other
@@ -733,7 +758,8 @@ def fit_step():
             for var in model_sub.trainable_variables:
                 model_name = var.name
                 none_bert_layer = ['tf_bert_model/bert/pooler/dense/kernel:0',
-                                   'tf_bert_model/bert/pooler/dense/bias:0']
+                                   'tf_bert_model/bert/pooler/dense/bias:0',
+                                   'Variable:0']
 
                 if model_name in none_bert_layer:
                     pass
@@ -743,6 +769,8 @@ def fit_step():
                     weights_other.append(var)
 
             weights_obj = model_obj.trainable_variables
+
+
             weights_pre = model_pre.trainable_variables
 
         params_all = tape.gradient(loss, [weights_bert, weights_other, weights_obj, weights_pre])
@@ -764,7 +792,7 @@ def fit_step():
 
     f1_value_mid, precision_mid, recall_mid = 0.370280600354258, 0.4655414908579591, 0.30738275808699417
 
-    for num in range(2, 15):
+    for num in range(1, 15):
         dataset = data_generator(spo_dataset)
         for _, data in enumerate(dataset):
             ids = data['input_ids']
@@ -793,31 +821,35 @@ def fit_step():
                     # 'wb' 要求写入字节(str.encode(str))
                     log = f"times: {datetime.now()}, " \
                           f"num: {_}, sub_loss: {loss_sub}, loss_obj: {loss_obj}, loss_pre: {loss_pre}, \n" \
-                          f"sub_labels[:1]: {sub_labels[:1]}, \n sub_predict[:1]: {p_sub[:1]}, \n" \
-                          f"obj_labels[:1]: {obj_labels[:1]}, \n obj_predict[:1]: {p_obj[:1]}, \n" \
+                          f"sub_labels[:1]: {sub_labels[:1]}, \n sub_predict[:1]: {tf.argmax(p_sub[:1][0], axis=1)}, \n" \
+                          f"obj_labels[:1]: {obj_labels[:1]}, \n obj_predict[:1]: {tf.argmax(p_obj[:1][0], axis=1)}, \n" \
                           f"pre_labels[:3]: {[tf.argmax(i, axis=1) for i in pre_labels[:3]]}, \n " \
                           f"pre_predict[:3]: {[tf.argmax(i, axis=1) for i in p_pre[:3]]}  \n"
                     f.write(log)
+
                 print(f"times: {datetime.now()}, num: {_}, sub_loss: {loss_sub}, loss_obj: {loss_obj}, loss_pre: {loss_pre}")
                 print(f"pre_predict: {tf.argmax(p_pre[0], axis=1)}")
                 print(f"pre_labels : {tf.argmax(pre_labels[0], axis=1)}")
+                print(f"sub_labels[:1]: {sub_labels[:1]}, \n sub_predict[:1]: {tf.argmax(p_sub[:1][0], axis=1)}, \n")
+                print(f"obj_labels[:1]: {obj_labels[:1]}, \n obj_predict[:1]: {tf.argmax(p_obj[:1][0], axis=1)}, \n")
 
-        model_sub.save(model_sub_path+'current/' + str(num) + '/n')
-        model_obj.save(model_obj_path+'current/' + str(num) + '/n')
-        model_pre.save(model_pre_path+'current/' + str(num) + '/n')
 
-        f1_value, precision, recall = evaluate()
+        model_sub.save(model_sub_path+'current_no_crf/' + str(num) + '/')
+        model_obj.save(model_obj_path+'current_no_crf/' + str(num) + '/')
+        model_pre.save(model_pre_path+'current_no_crf/' + str(num) + '/')
 
-        with open('models_save/fit_logs.txt', 'a') as f:
-            f.write(f"第{num}轮训练结束后, f1_value: {f1_value}, precision_value: {precision}, recall: {recall}")
-
-        if f1_value > f1_value_mid:
-            f1_value_mid = f1_value
-            model_sub.save(model_sub_path)
-            model_obj.save(model_obj_path)
-            model_pre.save(model_pre_path)
-            with open('models_save/fit_logs.txt', 'a') as f:
-                f.write(f"当前最优模型在第{num}轮保存！")
+        # f1_value, precision, recall = evaluate()
+        #
+        # with open('models_save/fit_logs.txt', 'a') as f:
+        #     f.write(f"第{num}轮训练结束后, f1_value: {f1_value}, precision_value: {precision}, recall: {recall}")
+        #
+        # if f1_value > f1_value_mid:
+        #     f1_value_mid = f1_value
+        #     model_sub.save(model_sub_path)
+        #     model_obj.save(model_obj_path)
+        #     model_pre.save(model_pre_path)
+        #     with open('models_save/fit_logs.txt', 'a') as f:
+        #         f.write(f"当前最优模型在第{num}轮保存！")
 
 # fit_step()
 
