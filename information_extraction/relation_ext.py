@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 
 import tensorflow as tf
+import tensorflow_addons as tfa
+from tensorflow import recompute_grad
 from tensorflow.keras import initializers, activations
 
 from datetime import datetime
@@ -28,7 +30,6 @@ tokenizer = BertTokenizer.from_pretrained("hfl/chinese-bert-wwm-ext")
 relation_ext_path = 'dataset/duie/duie_train.json/duie_train.json'
 valid_ds_path = 'dataset/duie/duie_dev.json/duie_dev.json'
 test_ds_path = 'dataset/duie/duie_test2.json/duie_test2.json'
-schema_ds_path = 'dataset/duie/duie_schema/duie_schema.json'
 
 max_len = 128
 
@@ -47,6 +48,7 @@ def get_dataset(path):
 
     for ds in dataset.readlines():
         ds = json.loads(ds)
+
         text = ds['text']
         if len(text) > max_len - 3:
             continue
@@ -89,6 +91,7 @@ def get_predict_vocab(dataset):
 
 
 spo_dataset = get_dataset(path=relation_ext_path)
+valid_dataset = get_dataset(path=valid_ds_path)
 predicate2id, id2predicate = get_predict_vocab(spo_dataset)
 batch_size = 25
 
@@ -102,9 +105,7 @@ def data_generator(dataset):
     4: position_predict: subject和object的位置信息以及predict的编码(通俗理解为类型)信息
     """
     ids, masks, tokens = [], [], []
-    subject_labels, object_labels, positions, text_lengths = [], [], [], []
-    # len_text: 用于后续处理padding的问题:
-    # 计算loss的时候去除掉padding_sequence的影响确保只计算文本长度范围内的损失值
+    subject_labels, object_labels, predicate_labels, positions = [], [], [], []
     dataset = dataset.sample(frac=1.0)
     for _, ds in dataset.iterrows():
         text = ''.join(ds['text'])
@@ -120,9 +121,12 @@ def data_generator(dataset):
         attention_mask = inputs['attention_mask']
         token_type_ids = inputs['token_type_ids']
 
-        mask4sub = np.zeros((max_len, 2), dtype=np.int32)
-        mask4obj = np.zeros((max_len, len(predicate2id), 2), dtype=np.int32)
-        # mask4pre = np.zeros(( 2), dtype=np.int32)
+        if len(input_id) > max_len:
+            continue
+
+        mask4sub = np.zeros((len(text)), dtype=np.int32)
+        mask4obj = np.zeros((len(text)), dtype=np.int32)
+        mask4pre = np.zeros((len(predicate2id), 2), dtype=np.int32)
 
         # 此处保存的位置信息仅用于标注obj时随机从多组s-p-o中抽出对应的位置信息
         sub_obj_predicate = {}
@@ -152,8 +156,11 @@ def data_generator(dataset):
 
             # 对于sub, 可以直接将对应在text的位置处标注出来
 
-            mask4sub[sub_position[0], 0] = 1
-            mask4sub[sub_position[1], 1] = 1
+            mask4sub = list(mask4sub) + (max_len - len(mask4sub)) * [0]
+
+            mask4sub = np.array(mask4sub)
+
+            mask4sub[sub_position[0]:sub_position[1]] = 1
 
         # 此处的位置信息是用于保存从多组s-p-o中抽取的那一组s-p-o的位置信息
         # 该位置信息后续将会用于同bert的encoder编码向量交互用于预测obj和predicate
@@ -161,42 +168,41 @@ def data_generator(dataset):
         if bool(sub_obj_predicate):
             sub = random.choice(list(sub_obj_predicate.keys()))
 
+            mask4obj = list(mask4obj) + (max_len - len(mask4obj)) * [0]
+            mask4obj = np.array(mask4obj)
             for obj_pre in sub_obj_predicate[sub]:
-                # mask4pre[obj_pre[1], 1] = 1
-                # 将对应的predicate位置处置为1
                 obj = obj_pre[0]
-                pre = obj_pre[1]
-                mask4obj[obj[0], pre, 0] = 1
-                mask4obj[obj[1], pre, 1] = 1
-
-            # mask4pre = np.array([[1, 0] if sum(mp)==0 else mp for mp in mask4pre])
+                mask4pre[obj_pre[1], 1] = 1
+                # 将对应的predicate位置处置为1
+                mask4obj[obj[0]:obj[1]] = 1
+            mask4pre = np.array([[1, 0] if sum(mp)==0 else mp for mp in mask4pre])
 
             choice_position.append((sub, sub_obj_predicate[sub]))
 
         if len(choice_position) >= 1:
             subject_labels.append(mask4sub)
             object_labels.append(mask4obj)
-            # predicate_labels.append(mask4pre)
+            predicate_labels.append(mask4pre)
             positions.append(choice_position)
             ids.append(input_id[:max_len])
             masks.append(attention_mask[:max_len])
             tokens.append(token_type_ids[:max_len])
-            text_lengths.append(len(text))
         else:
             continue
+
         if len(ids) == batch_size or _ == len(dataset):
             yield {
                 'input_ids': tf.constant(ids, dtype=tf.int32),
                 'masks': tf.constant(masks, dtype=tf.int32),
                 'tokens': tf.constant(tokens, dtype=tf.int32),
-                'subject_labels': tf.constant(subject_labels, dtype=tf.float32),
-                'object_labels': tf.constant(object_labels, dtype=tf.float32),
-                # 'predicate_labels': tf.constant(predicate_labels),
-                'positions': np.array(positions),
-                'text_lengths': np.array(text_lengths, dtype=np.int32)
+                'subject_labels': tf.constant(subject_labels, dtype=tf.int32),
+                'object_labels': tf.constant(object_labels, dtype=tf.int32),
+                'predicate_labels': tf.constant(predicate_labels),
+                'positions': np.array(positions)
             }
+            tf.keras.Sequential()
             ids, masks, tokens = [], [], []
-            subject_labels, object_labels, positions,  = [], [], []
+            subject_labels, object_labels, predicate_labels, positions = [], [], [], []
 
 
 class LayerNormalization(tf.keras.layers.Layer):
@@ -330,50 +336,73 @@ class ModelBertCrf4Sub(tf.keras.Model):
     使用bert&crf模型, 以序列标注的方法进行训练
     """
 
-    def __init__(self, output_dim):
-        super(ModelBertCrf4Sub, self).__init__(output_dim)
+    def __init__(self, output_dim, use_crf, _=None):
+        super(ModelBertCrf4Sub, self).__init__(output_dim, use_crf, _)
+        self.use_crf = use_crf
         self.output_dim = output_dim
-        self.bert = TFBertModel.from_pretrained('hfl/chinese-bert-wwm-ext', output_hidden_states=True)
+        self.bert = TFBertModel.from_pretrained('hfl/chinese-bert-wwm-ext')
         self.dropout = tf.keras.layers.Dropout(0.1)
-        tf.keras.layers.ReLU()
-        self.dense = tf.keras.layers.Dense(self.output_dim, activation='sigmoid')
+        self.dense = tf.keras.layers.Dense(self.output_dim)
+        self.other_params = tf.Variable(tf.random.uniform(shape=(self.output_dim, self.output_dim)))
+
 
     @tf.function(input_signature=[(tf.TensorSpec([None, max_len], name='input_ids', dtype=tf.int32),
                                    tf.TensorSpec([None, max_len], name='masks', dtype=tf.int32),
-                                   tf.TensorSpec([None, max_len], name='tokens', dtype=tf.int32))])
+                                   tf.TensorSpec([None, max_len], name='tokens', dtype=tf.int32),
+                                   tf.TensorSpec([None, max_len], name='target', dtype=tf.int32)),])
     def call(self, batch_data):
-        input_ids, masks, tokens = batch_data
+        input_ids, masks, tokens, target = batch_data
 
-        hidden = self.bert(input_ids, masks, tokens)
+        input_seq_len = tf.cast(tf.reduce_sum(masks, axis=1), dtype=tf.int32)
 
-        dropout_inputs = self.dropout(hidden[0], 1)
+        hidden = self.bert(input_ids, masks, tokens)[0]
+
+        dropout_inputs = self.dropout(hidden, 1)
 
         sub_predict = self.dense(dropout_inputs)
 
-        sub_predict = tf.keras.layers.Lambda(lambda x: x**2)(sub_predict)
+        sub_predict = tf.keras.layers.Lambda(lambda x: x ** 2)(sub_predict)
 
-        return sub_predict, hidden[2][-2]
+        if self.use_crf:
+            log_likelihood, self.other_params = tfa.text.crf.crf_log_likelihood(sub_predict,
+                                                                                target,
+                                                                                input_seq_len,
+                                                                                self.other_params)
+            decode_predict, crf_scores = tfa.text.crf_decode(sub_predict, self.other_params, input_seq_len)
+
+            return decode_predict, hidden, log_likelihood
+        else:
+            prob_seq = tf.nn.sigmoid(sub_predict)
+            return prob_seq, hidden, None
+
+    def return_crf(self):
+        return  self.use_crf
 
 
 class ModelCrf4Obj(tf.keras.Model):
     """该类用以获取object
     """
-    def __init__(self, output_dim):
-        super(ModelCrf4Obj, self).__init__(output_dim)
+    def __init__(self, output_dim, use_crf, _=None):
+        super(ModelCrf4Obj, self).__init__(output_dim, use_crf, _)
+        self.use_crf = use_crf
 
-        self.output_dim = output_dim
-
-        self.dense = tf.keras.layers.Dense(output_dim * 2, activation='sigmoid')
+        self.dense = tf.keras.layers.Dense(output_dim)
 
         self.layer_normal = LayerNormalization(conditional=True)
 
-        self.dropout = tf.keras.layers.Dropout(0.3)
+        self.dropout = tf.keras.layers.Dropout(0.1)
+
+        self.other_params = tf.Variable(tf.random.uniform(shape=(output_dim, output_dim)))
 
 
     @tf.function(input_signature=[(tf.TensorSpec([None, max_len, 768], name='hidden', dtype=tf.float32),
-                                   tf.TensorSpec([None, 768], name='weights_sub', dtype=tf.float32))])
+                                   tf.TensorSpec([None, 768], name='weights_sub', dtype=tf.float32),
+                                   tf.TensorSpec([None, max_len], name='obj_target', dtype=tf.int32),
+                                   tf.TensorSpec([None, max_len], name='masks', dtype=tf.int32))])
     def call(self, inputs):
-        hidden, weights_sub = inputs
+        hidden, weights_sub, obj_target, masks = inputs
+
+        input_seq_len = tf.cast(tf.reduce_sum(masks, axis=1), dtype=tf.int32)
 
         weights_sub = self.layer_normal([hidden, weights_sub])
 
@@ -381,12 +410,23 @@ class ModelCrf4Obj(tf.keras.Model):
 
         obj_predict = self.dense(weights_obj)
 
-        obj_predict = tf.keras.layers.Lambda(lambda x: x ** 4)(obj_predict)
+        obj_predict = tf.keras.layers.Lambda(lambda x: x**2)(obj_predict)
 
-        obj_predict = tf.keras.layers.Reshape((-1, self.output_dim, 2))(obj_predict)
+        if self.use_crf:
+            log_likelihood, self.other_params = tfa.text.crf.crf_log_likelihood(obj_predict,
+                                                                                obj_target,
+                                                                                input_seq_len,
+                                                                                self.other_params)
 
-        return obj_predict
+            obj_predict, _ = tfa.text.crf_decode(obj_predict, self.other_params, input_seq_len)
 
+            return obj_predict, log_likelihood
+        else:
+            obj_predict = tf.nn.sigmoid(obj_predict)
+            return obj_predict, None
+
+    def return_crf(self):
+        return self.use_crf
 
 
 class Model4Pre(tf.keras.Model):
@@ -411,11 +451,9 @@ class Model4Pre(tf.keras.Model):
 
         self.layer_normal = LayerNormalization(conditional=True)
 
-        self.obj_predict = tf.constant(1)
-
 
     @tf.function(input_signature=[(tf.TensorSpec([None, max_len, 768], name='hidden', dtype=tf.float32),
-                                   tf.TensorSpec([None, 128, 1536], name='trainable_weights', dtype=tf.float32))])
+                                   tf.TensorSpec([None, 1536], name='trainable_weights', dtype=tf.float32))])
     def call(self, inputs):
         hidden, weights_sub_obj = inputs
         # 此处trainable_weights包含(weights_sub, weights_obj)
@@ -428,28 +466,47 @@ class Model4Pre(tf.keras.Model):
 
         predict = self.dense(weights_sub_obj)
 
+        predict = tf.keras.layers.Lambda(lambda x: x**4)(predict)
+
         predict = self.reshape(predict)
+
+        predict = tf.squeeze(predict)
+
+        # predict = tf.nn.softmax(predict)
 
         return predict
 
 
-def loss4model(t, p, mask, obj=False):
-    """t: 实际labels, p: 预测labels, mask: shape-(Batch_size, max_len) bool矩阵用于解决padding的问题
-    subject的labels: [batch_size, max_len, 2]
-    object的labels: [batch_size, max_len, len(predicate2id), 2]
-    因此在进行loss操作时obj需要多进行一步reduce_mean的操作
-    """
-    if obj:
-        loss_value = tf.keras.losses.binary_crossentropy(y_true=t, y_pred=p)
-        loss_value = tf.reduce_sum(loss_value, axis=2)
-    else:
-        loss_value = tf.keras.losses.binary_crossentropy(y_true=t, y_pred=p)
 
-    loss_value = tf.cast(loss_value, dtype=tf.float32)
-    mask = tf.cast(mask, dtype=tf.float32)
+model_sub = ModelBertCrf4Sub(output_dim=2, use_crf=True)
+opti_bert_sub = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.9, beta_2=0.95)
+opti_other_sub = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.9, beta_2=0.95)
 
-    loss_value = tf.reduce_sum(loss_value * mask) / tf.reduce_sum(mask)
+model_obj = ModelCrf4Obj(output_dim=2, use_crf=True)
+opti_obj = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.9, beta_2=0.95)
 
+# 此处predicate种类是确定的因此作为分类模型考虑
+model_pre = Model4Pre(len(predicate2id))
+opti_pre = tf.keras.optimizers.Adam(learning_rate=1e-4, beta_1=0.9, beta_2=0.95)
+
+
+def loss4sub_obj_crf(log):
+    loss = -tf.reduce_mean(log)
+
+    return loss
+
+
+def loss4sub_obj(t, p):
+    loss_value = tf.keras.losses.sparse_categorical_crossentropy(y_true=t, y_pred=p)
+    loss_value = tf.reduce_mean(loss_value)
+
+    return loss_value
+
+
+def loss4pre(t, p):
+    # p = tf.round(p)
+    loss_value = tf.keras.losses.binary_crossentropy(y_true=t, y_pred=p)
+    loss_value = tf.reduce_mean(loss_value)
     return loss_value
 
 
@@ -489,11 +546,22 @@ def get_positions_hidden(positions, bert_hidden):
     return trainable_weights
 
 
-
 def concatenate_weights_sub(bert_encoder_hidden, positions):
     # 将subject对应位置的起始信息张量拼接起来
 
     trainable_weights = get_positions_hidden(positions, bert_encoder_hidden)
+
+    return trainable_weights
+
+
+def concatenate_weights_sub_obj(bert_encoder_hidden, positions):
+    positions_sub, positions_obj = positions
+
+    trainable_weights_sub = get_positions_hidden(positions_sub, bert_encoder_hidden)
+    trainable_weights_obj = get_positions_hidden(positions_obj, bert_encoder_hidden)
+
+    trainable_weights = tf.keras.layers.concatenate([trainable_weights_sub, trainable_weights_obj])
+    # shape: (batch_size, 768 * 2)
 
     return trainable_weights
 
@@ -511,11 +579,11 @@ def get_predict_data(content):
     input_mask = tf.constant([inputs['attention_mask'][:128]], dtype=tf.int32)
     token_type_ids = tf.constant([inputs["token_type_ids"][:128]], dtype=tf.int32)
 
-    return input_id, input_mask, token_type_ids
+    label = tf.constant([max_len * [0]], dtype=tf.int32)
+
+    return input_id, input_mask, token_type_ids, label
 
 
-# model_sub = tf.saved_model.load('models_save/model_sub/best_model/current_new_loss_new_lr/9/')
-# model_obj = tf.saved_model.load('models_save/model_obj/best_model/current_new_loss_new_lr/9/')
 def predict(content):
     """预测函数, 步骤如下：
     1: 预测subject
@@ -523,79 +591,98 @@ def predict(content):
     3: 按照循环的方式针对每一个subject进行object的预测
     4: 步骤同上获取object位置信息, 拆分, 按照每一组(subject, object)预测predicate, 并放入到spo列表中
     5: 整理spo列表传递到evaluate函数中"""
-    spos = []
-    input_id, input_mask, token_type_ids = get_predict_data(content=content)
 
-    predict_sub, bert_hidden = model_sub.call((input_id, input_mask, token_type_ids))
-    predict_sub = predict_sub[0]
-    sub_pos_start = np.where(predict_sub[:, 0] > 0.4)[0]
-    sub_pos_end = np.where(predict_sub[:, 1] > 0.4)[0]
-    if content[0] == '《':
-        print(content)
-        print(sub_pos_start, sub_pos_end)
+    input_id, input_mask, token_type_ids, label = get_predict_data(content=content)
 
+    # 需要以全局变量的形式出现
 
-    if len(sub_pos_start) == 0 or len(sub_pos_end) == 0:
-        return spos
+    def get_positions(value):
+        position = []
+        positions = []
 
-    for sub_s, sub_e in zip(sub_pos_start, sub_pos_end):
-        if sub_s > sub_e or sub_e > len(content):
-            continue
-        sub_pos = [sub_s, sub_e]
-        obj_weights = concatenate_weights_sub(bert_hidden, sub_pos)
+        value = np.where(value[0] > 0)[0]
+        for i in value:
+            if len(position) == 0:
+                position.append(i)
+                continue
+            if i - 1 == position[-1]:
+                position.append(i)
+            else:
+                positions.append(position)
+                position = [i]
+            if i == value[-1]:
+                positions.append(position)
 
-        predict_obj = model_obj.call((bert_hidden, obj_weights))
-        predict_obj = predict_obj[0]
+        positions = [(pos[0], pos[-1]) for pos in positions]
 
-        obj_pos_start = np.where(predict_obj[:, :, 0] >= 0.4)
-        obj_pos_end = np.where(predict_obj[:, :, 1] >= 0.4)
+        return positions
 
-        obj_start_pos = obj_pos_start[0]
-        obj_start_pre = obj_pos_start[1]
+    predict_sub, bert_hidden, _ = model_sub.call((input_id, input_mask, token_type_ids, label))
 
-        obj_end_pos = obj_pos_end[0]
-        obj_end_pre = obj_pos_end[1]
+    positions_sub = get_positions(predict_sub)
 
-        for num, (a, b) in enumerate(zip(obj_start_pos, obj_end_pos)):
-            if obj_start_pre[num] == obj_end_pre[num] and a <= b:
+    all_spo = []
 
-                if b > len(content):
+    if len(positions_sub) > 0:
+        for pos_sub in positions_sub:
+            obj_weights = concatenate_weights_sub(bert_encoder_hidden=bert_hidden,
+                                                  positions=pos_sub)
+            predict_obj, _ = model_obj.call((bert_hidden, obj_weights, label, input_mask))
+
+            positions_obj = get_positions(predict_obj)
+
+            if len(positions_obj) == 0:
+                continue
+
+            for pos_obj in positions_obj:
+                pos_sub_obj = [pos_sub, pos_obj]
+
+                pre_weights = concatenate_weights_sub_obj(bert_encoder_hidden=bert_hidden,
+                                                          positions=pos_sub_obj)
+
+                predict_pre = model_pre.call((bert_hidden, pre_weights))
+                predicate = tf.argmax(predict_pre, axis=1)
+
+                predicate = np.where(predicate > 0)[0]
+                if len(predicate) == 0:
                     continue
 
-                spos.append(
-                    (
-                        content[sub_pos[0]:sub_pos[1]],
-                        id2predicate[obj_start_pre[num]],
-                        content[a:b]
-                    )
-                )
+                predicate = predicate[0]
+                if pos_sub[-1] >= 127 or pos_obj[-1] >= 127:
+                    all_spo.append(([]))
+                else:
+                    all_spo.append(([pos_sub[0], pos_sub[1]],
+                                    predicate,
+                                    [pos_obj[0], pos_obj[1]]))
 
-    return spos
+        all_spo = [(content[spo[0][0]:(spo[0][1] + 1)],
+                    id2predicate[spo[1]],
+                    content[spo[2][0]:(spo[2][1] + 1)]) if len(spo) > 0 else () for spo in all_spo]
+
+    return all_spo
 
 
-def evaluate(path):
+def evaluate():
     """"""
-    dataset = open(path)
-
     len_lab = 1e-10
     len_pre = 1e-10
     len_pre_is_true = 1e-10
     num = 0
-    for ds in dataset.readlines():
-        ds = json.loads(ds)
+    val_dataset = valid_dataset
+
+    for _, ds in val_dataset.iterrows():
         text = ds['text']
-        if len(text) > 126:
-            continue
-        num += 1
+
         spo_t = ds['spo_list']
         spo_labels = set([(spo['subject'], spo['predicate'], spo['object']['@value']) for spo in spo_t])
         spo_predicts = set(predict(content=text))
-        if num % 200 == 0:
-            print("spo_labels: ", spo_labels)
-            print("spo_predicts: ", spo_predicts)
         len_lab += len(spo_labels)
         len_pre += len(spo_predicts)
         len_pre_is_true += len(spo_labels & spo_predicts)
+        num += 1
+        if num % 200==0:
+            print(spo_predicts)
+            print(spo_labels)
         # & 该运算的作用是返回两个输入内部相同的值
         # a: [(1, 2), (3, 4), (5, 6)],  b: [(3, 4), (1, 2), (6, 5)]
         # 返回 [(1, 2), (3, 4)]
@@ -606,112 +693,78 @@ def evaluate(path):
 
     return f1_value, precision, recall
 
-# print(evaluate(path=valid_ds_path))
-
-# 4: (0.5821507858982343, 0.688787089182148, 0.5041063024822383)
-# 5: (0.5825210760199712, 0.7183384448854423, 0.4898957275998908)
-# 9: (0.5848143281930724, 0.6676666798247358, 0.5202546830303605)
-
-def predict_test():
-    dataset = open(test_ds_path)
-
-    schema_ds = open(schema_ds_path)
-
-    schema_ds = pd.DataFrame(schema_ds, columns=['schema'])
-
-    schema_ds['predicate'] = schema_ds['schema'].apply(
-        lambda x: json.loads(x)['predicate']
-    )
-    schema_ds['subject_type'] = schema_ds['schema'].apply(
-        lambda x: json.loads(x)['subject_type']
-    )
-    schema_ds['object_type'] = schema_ds['schema'].apply(
-        lambda x: json.loads(x)['object_type']['@value']
-    )
-
-    for ds in dataset.readlines():
-        # 物流作业方法
-        # 数据分析方法五种
-        # 比较新闻传播学
-        x = x + 1
-        if x == 500:
-            break
-        spo_test = {'spo_list': []}
-        ds = json.loads(ds)
-        text = ds['text']
-        spo_predict = set(predict(text))
-        spo_test['text'] = text
-
-        for spo in spo_predict:
-            spos = {}
-            s = spo[0]
-            p = spo[1]
-            o = spo[2]
-            spos['predicate'] = p
-            spos['subject'] = s
-            spos['object'] = {'@value': o}
-            spos['subject_type'] = schema_ds.loc[schema_ds['predicate']==p]['subject_type'].values[0]
-            spos['object_type'] = schema_ds.loc[schema_ds['predicate']==p]['object_type'].values[0]
-            spo_test['spo_list'].append(spos)
-
 
 def fit_step():
 
-    model_sub = ModelBertCrf4Sub(output_dim=2)
-    opti_sub = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.90, beta_2=0.95)
-
-    model_obj = ModelCrf4Obj(output_dim=len(predicate2id))
-    opti_obj = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.90, beta_2=0.95)
-
-    # 此处predicate种类是确定的因此作为分类模型考虑
-    # model_pre = Model4Pre(len(predicate2id))
-    # opti_pre = tf.keras.optimizers.Adam(learning_rate=1e-3, beta_1=0.9, beta_2=0.95)
-
-
     def fit_models(inputs_model, inputs_labels, inputs_other):
-        positions_sub, positions_obj, text_lengths = inputs_other
-        sub_label, obj_label = inputs_labels
+        positions_sub, positions_obj = inputs_other
+        sub_label, obj_label, pre_label = inputs_labels
         ids, masks, tokens = inputs_model
-        weights_sub = []
+        weights_bert = []  # bert参数权重获取
+        weights_other = []  # crf和其它层参数权重
+
         with tf.GradientTape() as tape:
-            predict_sub, bert_hidden = model_sub(batch_data=(ids, masks, tokens))
+            predict_sub, bert_hidden, logs_sub = model_sub(batch_data=(ids, masks, tokens, sub_label))
 
             obj_weights = concatenate_weights_sub(bert_encoder_hidden=bert_hidden,
                                                   positions=positions_sub)
 
-            predict_obj = model_obj(inputs=(bert_hidden, obj_weights))
+            predict_obj, logs_obj = model_obj(inputs=(bert_hidden, obj_weights, obj_label, masks))
 
-            loss_sub = loss4model(t=sub_label, p=predict_sub, mask=masks)
+            pre_weights = concatenate_weights_sub_obj(bert_encoder_hidden=bert_hidden,
+                                                      positions=[positions_sub, positions_obj])
 
-            loss_obj = loss4model(t=obj_label, p=predict_obj, mask=masks, obj=True)
+            predict_pre = model_pre(inputs=(bert_hidden, pre_weights))
 
-            loss = loss_sub + loss_obj
+            if model_sub.return_crf():
+                loss_sub = loss4sub_obj_crf(logs_sub)
+            else:
+                loss_sub = loss4sub_obj(t=sub_label, p=predict_sub)
 
+            if model_obj.return_crf():
+                loss_obj = loss4sub_obj_crf(logs_obj)
+            else:
+                loss_obj = loss4sub_obj(t=obj_label, p=predict_obj)
+
+            loss_pre = loss4pre(t=pre_label, p=predict_pre)
+
+            loss = loss_obj + loss_sub + loss_pre
 
             for var in model_sub.trainable_variables:
                 model_name = var.name
                 none_bert_layer = ['tf_bert_model/bert/pooler/dense/kernel:0',
-                                   'tf_bert_model/bert/pooler/dense/bias:0',
-                                   'Variable:0']
-                if model_name not in none_bert_layer:
-                    weights_sub.append(var)
+                                   'tf_bert_model/bert/pooler/dense/bias:0']
+
+                if model_name in none_bert_layer:
+                    pass
+                elif model_name.startswith('tf_bert_model'):
+                    weights_bert.append(var)
+                else:
+                    weights_other.append(var)
 
             weights_obj = model_obj.trainable_variables
-            # weights_pre = model_pre.trainable_variables
+            weights_pre = model_pre.trainable_variables
 
-        params_all = tape.gradient(loss, [weights_sub, weights_obj])
+        params_all = tape.gradient(loss, [weights_bert, weights_other, weights_obj, weights_pre])
 
-        params_sub = params_all[0]
-        params_obj = params_all[1]
-        opti_sub.apply_gradients(zip(params_sub, weights_sub))
+        params_bert_sub = params_all[0]
+        params_other_sub = params_all[1]
+        params_obj = params_all[2]
+        params_pre = params_all[3]
+
+        opti_bert_sub.apply_gradients(zip(params_bert_sub, weights_bert))
+        opti_other_sub.apply_gradients(zip(params_other_sub, weights_other))
 
         opti_obj.apply_gradients(zip(params_obj, weights_obj))
 
+        opti_pre.apply_gradients(zip(params_pre, weights_pre))
+
         # predict: 预测获取的sub, weights: inputs的bert编码层feed&forward层向量
-        return predict_sub, predict_obj, loss_sub, loss_obj
+        return predict_sub, predict_obj, predict_pre, loss_sub, loss_obj, loss_pre
 
+    f1_value_mid, precision_mid, recall_mid = 0.370280600354258, 0.4655414908579591, 0.30738275808699417
 
-    for num in range(0, 15):
+    for num in range(2, 15):
         dataset = data_generator(spo_dataset)
         for _, data in enumerate(dataset):
             ids = data['input_ids']
@@ -719,9 +772,8 @@ def fit_step():
             tokens = data['tokens']
             sub_labels = data['subject_labels']
             obj_labels = data['object_labels']
-            # pre_labels = data['predicate_labels']
+            pre_labels = data['predicate_labels']
             positions = data['positions']
-            text_lengths = data['text_lengths']
 
             sub_positions = [ps[0][0] for ps in positions]  # subject的位置信息
             obj_predicate = [ps[0][1] for ps in positions]  # object和predicate的信息
@@ -729,10 +781,10 @@ def fit_step():
 
             # 位置信息: 用于在预测object和predicate时同bert-encoder编码信息交互
 
-            p_sub, p_obj, loss_sub, loss_obj = fit_models(
+            p_sub, p_obj, p_pre, loss_sub, loss_obj, loss_pre = fit_models(
                 inputs_model=[ids, masks, tokens],
-                inputs_labels=[sub_labels, obj_labels],
-                inputs_other=[sub_positions, obj_positions, text_lengths]
+                inputs_labels=[sub_labels, obj_labels, pre_labels],
+                inputs_other=[sub_positions, obj_positions]
             )
 
             if _ % 500 == 0:
@@ -740,12 +792,36 @@ def fit_step():
                     # 'a'  要求写入字符
                     # 'wb' 要求写入字节(str.encode(str))
                     log = f"times: {datetime.now()}, " \
-                          f"num: {_}, sub_loss: {loss_sub}, loss_obj: {loss_obj}, loss_pre: {None}, \n" \
-
+                          f"num: {_}, sub_loss: {loss_sub}, loss_obj: {loss_obj}, loss_pre: {loss_pre}, \n" \
+                          f"sub_labels[:1]: {sub_labels[:1]}, \n sub_predict[:1]: {p_sub[:1]}, \n" \
+                          f"obj_labels[:1]: {obj_labels[:1]}, \n obj_predict[:1]: {p_obj[:1]}, \n" \
+                          f"pre_labels[:3]: {[tf.argmax(i, axis=1) for i in pre_labels[:3]]}, \n " \
+                          f"pre_predict[:3]: {[tf.argmax(i, axis=1) for i in p_pre[:3]]}  \n"
                     f.write(log)
-                    print(log)
-        model_sub.save(model_sub_path + 'current_new_loss_new_lr_new_hidden/' + str(num) + '/')
-        model_obj.save(model_obj_path + 'current_new_loss_new_lr_new_hidden/' + str(num) + '/')
+                print(f"times: {datetime.now()}, num: {_}, sub_loss: {loss_sub}, loss_obj: {loss_obj}, loss_pre: {loss_pre}")
+                print(f"pre_predict: {tf.argmax(p_pre[0], axis=1)}")
+                print(f"pre_labels : {tf.argmax(pre_labels[0], axis=1)}")
 
+        model_sub.save(model_sub_path+'current/' + str(num) + '/n')
+        model_obj.save(model_obj_path+'current/' + str(num) + '/n')
+        model_pre.save(model_pre_path+'current/' + str(num) + '/n')
+
+        f1_value, precision, recall = evaluate()
+
+        with open('models_save/fit_logs.txt', 'a') as f:
+            f.write(f"第{num}轮训练结束后, f1_value: {f1_value}, precision_value: {precision}, recall: {recall}")
+
+        if f1_value > f1_value_mid:
+            f1_value_mid = f1_value
+            model_sub.save(model_sub_path)
+            model_obj.save(model_obj_path)
+            model_pre.save(model_pre_path)
+            with open('models_save/fit_logs.txt', 'a') as f:
+                f.write(f"当前最优模型在第{num}轮保存！")
 
 # fit_step()
+
+
+
+
+
