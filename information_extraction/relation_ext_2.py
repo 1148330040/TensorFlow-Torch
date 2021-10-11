@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 import tensorflow as tf
+from bert4keras.snippets import sequence_padding
 from tensorflow.keras import initializers, activations
 
 from datetime import datetime
@@ -102,102 +103,117 @@ def data_generator(dataset):
     4: position_predict: subject和object的位置信息以及predict的编码(通俗理解为类型)信息
     """
     ids, masks, tokens = [], [], []
-    subject_labels, object_labels, positions, predicate_labels = [], [], [], []
+    subject_labels, object_labels, predicate_labels, positions = [], [], [], []
     # len_text: 用于后续处理padding的问题:
     # 计算loss的时候去除掉padding_sequence的影响确保只计算文本长度范围内的损失值
-    # dataset = dataset.sample(frac=1.0)
+
     for _, ds in dataset.iterrows():
         text = ''.join(ds['text'])
-        # if text[0] == '《':
-        #     text = np.random.choice(['abc', 'esd', 'asd', 'qes', 'fgf', 'ckl', 'sa', 'qwe', 'sdz']) + text
+
         spo_lists = ds['spo_list']
 
-        inputs = tokenizer.encode_plus(text,
-                                       add_special_tokens=True,
-                                       max_length=max_len,
-                                       padding='max_length',
-                                       return_token_type_ids=True)
+        inputs = tokenizer.encode_plus(text)
 
         input_id = inputs['input_ids']
         attention_mask = inputs['attention_mask']
         token_type_ids = inputs['token_type_ids']
+        spo_all = {}
+
+        def get_seq_pos(seq):
+            """不要通过词在text中的位置信息找，因为有可能部分符号或者特殊字符编码后的长度与text长度不一致
+            """
+
+            seq_len = len(seq)
+            for i in range(len(input_id)):
+                if input_id[i:i + seq_len] == seq:
+                    return i
+            return -1
 
         mask4sub = np.zeros((max_len, 2), dtype=np.int32)
-        mask4obj = np.zeros((max_len, 2), dtype=np.int32)
-        mask4pre = np.zeros((len(predicate2id), 2), dtype=np.int32)
-
-        # 此处保存的位置信息仅用于标注obj时随机从多组s-p-o中抽出对应的位置信息
-        sub_obj_predicate = {}
-        choice_position = []
-
         for spo_list in spo_lists:
 
             sub = spo_list['subject']
             obj = spo_list['object']['@value']
 
             predicate = spo_list['predicate']
-            if len(predicate) < 1:
-                continue
+
             predicate = predicate2id[predicate]
 
-            try:
-                sub_position = (text.index(sub), text.index(sub) + len(sub))
-                obj_position = (text.index(obj), text.index(obj) + len(obj))
-            except:
+            sub_seq = tokenizer.encode(sub)[1:-1]
+            obj_seq = tokenizer.encode(obj)[1:-1]
+
+            sub_pos = get_seq_pos(sub_seq)
+            obj_pos = get_seq_pos(obj_seq)
+
+            if sub_pos + len(sub_seq) > 126 or obj_pos + len(obj_seq) > 126:
+
                 continue
 
-            # +1的原因是因为token会在text前加一个开始编码101
+            if sub_pos != -1 and obj_pos != -1:
+                sub_pos = (sub_pos, sub_pos + len(sub_seq))
 
-            if sub_position not in sub_obj_predicate:
-                sub_obj_predicate[sub_position] = []
-            sub_obj_predicate[sub_position].append((obj_position, predicate))
+                mask4sub[sub_pos[0], 0] = 1
+                mask4sub[sub_pos[1], 1] = 1
+                # 如果后续截取的subject位置向量是开头和结束, 那么需要sub_pos + len(sub_seq) -1
+                # 如果后续截取的是subject的词向量则不需要-1
+                obj_pos = (obj_pos, obj_pos + len(obj_seq), predicate)
+                if sub_pos not in spo_all:
+                    spo_all[sub_pos] = []
+                spo_all[sub_pos].append(obj_pos)
 
-            # 对于sub, 可以直接将对应在text的位置处标注出来
+                # 此处的位置信息是用于保存从多组s-p-o中抽取的那一组s-p-o的位置信息
+                # 该位置信息后续将会用于同bert的encoder编码向量交互用于预测obj和predicate
 
-            mask4sub[sub_position[0], 0] = 1
-            mask4sub[sub_position[1], 1] = 1
 
-        # 此处的位置信息是用于保存从多组s-p-o中抽取的那一组s-p-o的位置信息
-        # 该位置信息后续将会用于同bert的encoder编码向量交互用于预测obj和predicate
+        if bool(spo_all):
+            mask4obj = np.zeros((max_len, 2), dtype=np.int32)
+            mask4pre = np.zeros((len(predicate2id), 2), dtype=np.int32)
 
-        if bool(sub_obj_predicate):
-            sub = random.choice(list(sub_obj_predicate.keys()))
+            start, end = np.array(list(spo_all.keys())).T
 
-            for obj_pre in sub_obj_predicate[sub]:
-                # mask4pre[obj_pre[1], 1] = 1
-                # 将对应的predicate位置处置为1
-                obj = obj_pre[0]
-                pre = obj_pre[1]
-                mask4pre[pre, 1] = 1
-                mask4obj[obj[0], 0] = 1
-                mask4obj[obj[1], 1] = 1
+            start = np.random.choice(start)
+            end = np.random.choice(end[end >= start])
 
-            # mask4pre = np.array([[1, 0] if sum(mp)==0 else mp for mp in mask4pre])
+            subject_ids = (start, end)
+            object_ids = (0, 0)
 
-            choice_position.append((sub, sub_obj_predicate[sub]))
+            if bool(subject_ids) is False:
+                continue
 
-        if len(choice_position) >= 1:
+            for o in spo_all.get(subject_ids, []):
+                mask4pre[o[2], 1] = 1
+                mask4obj[o[0], 0] = 1
+                mask4obj[o[1], 1] = 1
+
+                object_ids = (o[0], o[1])
+
+            ids.append(input_id)
+            masks.append(attention_mask)
+            tokens.append(token_type_ids)
             subject_labels.append(mask4sub)
             object_labels.append(mask4obj)
             predicate_labels.append(mask4pre)
-            positions.append(choice_position)
-            ids.append(input_id[:max_len])
-            masks.append(attention_mask[:max_len])
-            tokens.append(token_type_ids[:max_len])
-        else:
-            continue
-        if len(ids) == batch_size or _ == len(dataset):
-            yield {
-                'input_ids': tf.constant(ids, dtype=tf.int32),
-                'masks': tf.constant(masks, dtype=tf.int32),
-                'tokens': tf.constant(tokens, dtype=tf.int32),
-                'subject_labels': tf.constant(subject_labels, dtype=tf.float32),
-                'object_labels': tf.constant(object_labels, dtype=tf.float32),
-                'predicate_labels': tf.constant(predicate_labels),
-                'positions': np.array(positions),
-            }
-            ids, masks, tokens = [], [], []
-            subject_labels, object_labels, positions, predicate_labels  = [], [], [], []
+            positions.append([subject_ids, object_ids])
+
+            if len(ids) == batch_size or _ == len(dataset):
+                ids = sequence_padding(ids, max_len)
+                masks = sequence_padding(masks, max_len)
+                tokens = sequence_padding(tokens, max_len)
+                subject_labels = sequence_padding(subject_labels, max_len)
+                object_labels = sequence_padding(object_labels, max_len)
+
+                yield {
+                    'input_ids': tf.constant(ids, dtype=tf.int32),
+                    'masks': tf.constant(masks, dtype=tf.int32),
+                    'tokens': tf.constant(tokens, dtype=tf.int32),
+                    'subject_labels': tf.constant(subject_labels, dtype=tf.float32),
+                    'object_labels': tf.constant(object_labels, dtype=tf.float32),
+                    'predicate_labels': tf.constant(predicate_labels, dtype=tf.float32),
+                    'positions': np.array(positions),
+                }
+
+                ids, masks, tokens = [], [], []
+                subject_labels, object_labels, predicate_labels, positions = [], [], [], []
 
 
 class LayerNormalization(tf.keras.layers.Layer):
@@ -463,12 +479,12 @@ def loss4model_pre(t, p):
 def get_positions_hidden(positions, bert_hidden):
     """用于提取给定位置处的张量
     """
-
     weights = tf.ones(shape=(1, 768))
-
     if bert_hidden.shape[0] == 1:
-        pos = (np.arange(positions[0], positions[1] + 1))
-        weight = tf.gather(bert_hidden, [pos], batch_dims=1)
+        poses = (np.arange(positions[0], positions[1]))
+        if len(poses) == 0:
+            poses = ([positions[0]])
+        weight = tf.gather(bert_hidden, [poses], batch_dims=1)
         weight = tf.reduce_mean(weight, axis=1)
 
         return weight
@@ -477,10 +493,13 @@ def get_positions_hidden(positions, bert_hidden):
         hidden = tf.expand_dims(bert_hidden[num], 0)
         # 首先为hidden添加一个维度
         # bert_hidden[num]->(128, 768)变为(1, 128, 768)目的是为了提取对应位置信息的张量
-        pos = (np.arange(pos[0], pos[1] + 1))
-        # 将起始位置张量变为一个range
 
-        weight = tf.gather(hidden, [pos], batch_dims=1)
+        poses = (np.arange(pos[0], pos[1]))
+        if len(poses) == 0:
+            poses = ([pos[0]])
+
+        # 将起始位置张量变为一个range
+        weight = tf.gather(hidden, [poses], batch_dims=1)
         # 提取对应的张量
 
         weight = tf.reduce_mean(weight, axis=1)
@@ -491,7 +510,6 @@ def get_positions_hidden(positions, bert_hidden):
 
     trainable_weights = weights[1:]
     # shape: (batch_size, 768)
-
 
     return trainable_weights
 
@@ -519,22 +537,42 @@ def concatenate_weights_sub_obj(bert_encoder_hidden, positions):
 def get_predict_data(content):
     """将输入的问句初步token处理
     """
-    inputs = tokenizer.encode_plus(content,
-                                   add_special_tokens=True,
-                                   max_length=max_len,
-                                   padding='max_length',
-                                   return_token_type_ids=True)
+    inputs = tokenizer.encode_plus(content)
 
-    input_id = tf.constant([inputs['input_ids'][:128]], dtype=tf.int32)
-    input_mask = tf.constant([inputs['attention_mask'][:128]], dtype=tf.int32)
-    token_type_ids = tf.constant([inputs["token_type_ids"][:128]], dtype=tf.int32)
+    input_id = tf.constant([inputs['input_ids']], dtype=tf.int32)
+    input_mask = tf.constant([inputs['attention_mask']], dtype=tf.int32)
+    token_type_ids = tf.constant([inputs["token_type_ids"]], dtype=tf.int32)
 
-    return input_id, input_mask, token_type_ids
+    id_length = len(input_id[0])
+
+    input_id = sequence_padding(input_id, length=128)
+    input_mask = sequence_padding(input_mask, length=128)
+    token_type_ids = sequence_padding(token_type_ids, length=128)
+
+    return input_id, input_mask, token_type_ids, id_length
 
 
-model_sub = tf.saved_model.load('models_save/model_sub/best_model/current_three_models/10/')
-model_obj = tf.saved_model.load('models_save/model_obj/best_model/current_three_models/10/')
-model_pre = tf.saved_model.load('models_save/model_pre/best_model/current_three_models/10/')
+class SPO(tuple):
+    """用来存三元组的类
+    表现跟tuple基本一致，只是重写了 __hash__ 和 __eq__ 方法，
+    使得在判断两个三元组是否等价时容错性更好。
+    """
+    def __init__(self, spo):
+        self.spox = (
+            tuple(tokenizer.tokenize(spo[0])),
+            spo[1],
+            tuple(tokenizer.tokenize(spo[2])),
+        )
+
+    def __hash__(self):
+        return self.spox.__hash__()
+
+    def __eq__(self, spo):
+        return self.spox == spo.spox
+
+model_sub = tf.saved_model.load('models_save/model_sub/best_model/current_three_models/0/')
+model_obj = tf.saved_model.load('models_save/model_obj/best_model/current_three_models/0/')
+model_pre = tf.saved_model.load('models_save/model_pre/best_model/current_three_models/0/')
 
 def predict(content):
     """预测函数, 步骤如下：
@@ -544,55 +582,65 @@ def predict(content):
     4: 步骤同上获取object位置信息, 拆分, 按照每一组(subject, object)预测predicate, 并放入到spo列表中
     5: 整理spo列表传递到evaluate函数中"""
     spos = []
-    input_id, input_mask, token_type_ids = get_predict_data(content=content)
+
+    input_id, input_mask, token_type_ids, id_length = get_predict_data(content=content)
 
     predict_sub, bert_hidden = model_sub.call((input_id, input_mask, token_type_ids))
     predict_sub = predict_sub[0]
-    sub_pos_start = np.where(predict_sub[:, 0] > 0.4)[0]
-    sub_pos_end = np.where(predict_sub[:, 1] > 0.4)[0]
+    sub_pos_start = np.where(predict_sub[:, 0] > 0.5)[0]
+    sub_pos_end = np.where(predict_sub[:, 1] > 0.6)[0]
+    # print(sub_pos_start, sub_pos_end)
+    subjects = []
+    for i in sub_pos_start:
+        j = sub_pos_end[sub_pos_end >= i]
+        if len(j) > 0:
+            j = j[0]
+            subjects.append((i, j))
 
+    for sub_pos in subjects:
+        sub_s, sub_e = sub_pos[0], sub_pos[1]
+        if sub_s <= sub_e <= id_length + 1:
 
-    if len(sub_pos_start) == 0 or len(sub_pos_end) == 0:
-        sub_pos_start = np.where(predict_sub[:, 0] > 0.1)[0]
-        sub_pos_end = np.where(predict_sub[:, 1] > 0.1)[0]
-        if len(sub_pos_start) == 0 or len(sub_pos_end) == 0:
-            return spos
+            sub_pos = [sub_s, sub_e]
+            obj_weights = concatenate_weights_sub(bert_hidden, sub_pos)
 
-    for sub_s, sub_e in zip(sub_pos_start, sub_pos_end):
+            predict_obj = model_obj.call((bert_hidden, obj_weights))
+            predict_obj = predict_obj[0]
 
-        if sub_s > sub_e or sub_e > len(content):
-            continue
+            obj_pos_start = np.where(predict_obj[:, 0] > 0.5)[0]
+            obj_pos_end = np.where(predict_obj[:, 1] > 0.6)[0]
 
-        sub_pos = [sub_s, sub_e]
-        obj_weights = concatenate_weights_sub(bert_hidden, sub_pos)
+            objects = []
+            for i in obj_pos_start:
+                j = obj_pos_end[obj_pos_end >= i]
+                if len(j) > 0:
+                    j = j[0]
+                    objects.append((i, j))
 
-        predict_obj = model_obj.call((bert_hidden, obj_weights))
-        predict_obj = predict_obj[0]
+            for obj_pos in objects:
+                obj_s, obj_e = obj_pos[0], obj_pos[1]
+                if obj_s <= obj_e <= id_length + 1:
+                    obj_pos = [obj_s, obj_e]
 
-        obj_pos_start = np.where(predict_obj[:, 0] > 0.4)[0]
-        obj_pos_end = np.where(predict_obj[:, 1] > 0.4)[0]
-
-        if len(obj_pos_start) == 0 or len(obj_pos_end) == 0:
-            obj_pos_start = np.where(predict_obj[:, 0] > 0.1)[0]
-            obj_pos_end = np.where(predict_obj[:, 1] > 0.1)[0]
-            if len(obj_pos_start) == 0 or len(obj_pos_end) == 0:
-                return spos
-
-        for obj_s, obj_e in zip(obj_pos_start, obj_pos_end):
-            if (len(content) + 2) >= obj_e >= obj_s:
-                obj_pos = [obj_s, obj_e]
-                pre_weights = concatenate_weights_sub_obj(bert_encoder_hidden=bert_hidden, positions=[sub_pos, obj_pos])
-                predicate = model_pre(pre_weights)
-                predicate = tf.squeeze(predicate, 1)[0]
-                predicate = np.where(predicate[:, 1] > 0.5)[0]
-                if len(predicate) > 0:
-                    spos.append(
-                        (
-                            content[sub_pos[0]:sub_pos[1]],
-                            id2predicate[predicate[0]],
-                            content[obj_pos[0]:obj_pos[1]]
+                    pre_weights = concatenate_weights_sub_obj(bert_hidden, positions=[sub_pos, obj_pos])
+                    predicate = model_pre.call(pre_weights)
+                    predicate = tf.squeeze(predicate, 1)[0]
+                    predicate = np.where(predicate[:, 1] > 0.5)[0]
+                    if len(predicate) > 0:
+                        s = ''.join(tokenizer.decode(input_id[0][sub_pos[0]:sub_pos[1]]).split(' '))
+                        o = ''.join(tokenizer.decode(input_id[0][obj_pos[0]:obj_pos[1]]).split(' '))
+                        for mask in ['[SEP]', '[PAD]', '[UNK]', '[UNK]']:
+                            while mask in o:
+                                o = o.replace(mask, '')
+                            while mask in s:
+                                s = s.replace(mask, '')
+                        spos.append(
+                            (
+                                s,
+                                id2predicate[predicate[0]],
+                                o
+                            )
                         )
-                    )
 
     return spos
 
@@ -608,7 +656,7 @@ def evaluate(path):
     for ds in dataset.readlines():
         ds = json.loads(ds)
         text = ds['text']
-        if len(text) > 126:
+        if len(text) > 125:
             continue
         num += 1
         spo_t = ds['spo_list']
@@ -629,6 +677,8 @@ def evaluate(path):
     recall = len_pre_is_true / len_lab
 
     return f1_value, precision, recall
+
+print(evaluate(valid_ds_path))
 
 
 def predict_test():
@@ -749,10 +799,8 @@ def fit_step():
             pre_labels = data['predicate_labels']
             positions = data['positions']
 
-            sub_positions = [ps[0][0] for ps in positions]  # subject的位置信息
-            obj_predicate = [ps[0][1] for ps in positions]  # object和predicate的信息
-            obj_positions = [ps[0][0] for ps in obj_predicate]  # object的位置信息
-
+            sub_positions = [ps[0] for ps in positions]  # subject的位置信息
+            obj_positions = [ps[1] for ps in positions]  # object的位置信息
             # 位置信息: 用于在预测object和predicate时同bert-encoder编码信息交互
 
             p_sub, p_obj, loss_sub, loss_obj, loss_pre = fit_models(
