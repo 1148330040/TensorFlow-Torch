@@ -822,5 +822,3 @@ def fit_step():
         model_obj.save(model_obj_path + 'current_three_models/' + str(num) + '/')
         model_pre.save(model_pre_path + 'current_three_models/' + str(num) + '/')
 
-
-# fit_step()
