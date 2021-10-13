@@ -26,16 +26,16 @@ tf.config.experimental_run_functions_eagerly(True)
 
 tokenizer = BertTokenizer.from_pretrained("hfl/chinese-bert-wwm-ext")
 
-relation_ext_path = 'dataset/duie/duie_train.json/duie_train.json'
-valid_ds_path = 'dataset/duie/duie_dev.json/duie_dev.json'
-test_ds_path = 'dataset/duie/duie_test2.json/duie_test2.json'
-schema_ds_path = 'dataset/duie/duie_schema/duie_schema.json'
+relation_ext_path = '../dataset/duie/duie_train.json/duie_train.json'
+valid_ds_path = '../dataset/duie/duie_dev.json/duie_dev.json'
+test_ds_path = '../dataset/duie/duie_test2.json/duie_test2.json'
+schema_ds_path = '../dataset/duie/duie_schema/duie_schema.json'
 
 max_len = 128
 
-model_sub_path = f'models_save/model_sub/best_model/'
-model_obj_path = f'models_save/model_obj/best_model/'
-model_pre_path = f'models_save/model_pre/best_model/'
+model_sub_path = f'../models_save/model_sub/best_model/'
+model_obj_path = f'../models_save/model_obj/best_model/'
+model_pre_path = f'../models_save/model_pre/best_model/'
 
 
 def get_dataset(path):
@@ -810,7 +810,7 @@ def fit_step():
             )
 
             if _ % 500 == 0:
-                with open('models_save/fit_logs.txt', 'a') as f:
+                with open('../models_save/fit_logs.txt', 'a') as f:
                     # 'a'  要求写入字符
                     # 'wb' 要求写入字节(str.encode(str))
                     log = f"times: {datetime.now()}, " \

@@ -27,15 +27,15 @@ tf.config.experimental_run_functions_eagerly(True)
 
 tokenizer = BertTokenizer.from_pretrained("hfl/chinese-bert-wwm-ext")
 
-relation_ext_path = 'dataset/duie/duie_train.json/duie_train.json'
-valid_ds_path = 'dataset/duie/duie_dev.json/duie_dev.json'
-test_ds_path = 'dataset/duie/duie_test2.json/duie_test2.json'
-schema_ds_path = 'dataset/duie/duie_schema/duie_schema.json'
+relation_ext_path = '../dataset/duie/duie_train.json/duie_train.json'
+valid_ds_path = '../dataset/duie/duie_dev.json/duie_dev.json'
+test_ds_path = '../dataset/duie/duie_test2.json/duie_test2.json'
+schema_ds_path = '../dataset/duie/duie_schema/duie_schema.json'
 
 max_len = 128
 
-model_sub_path = f'models_save/model_sub/best_model/'
-model_obj_path = f'models_save/model_obj/best_model/'
+model_sub_path = f'../models_save/model_sub/best_model/'
+model_obj_path = f'../models_save/model_obj/best_model/'
 
 
 def get_dataset(path):
@@ -71,15 +71,15 @@ def predicate2seq(dataset):
 
     predicate_vocabs = {word: num for num, word in enumerate(spo_predicates)}
 
-    vocabs = open('dataset/predicate_vocabs.json', 'w')
+    vocabs = open('../dataset/predicate_vocabs.json', 'w')
     vocabs.write(json.dumps(predicate_vocabs))
 
     return predicate_vocabs
 
 
 def get_predict_vocab(dataset):
-    if os.path.exists('dataset/predicate_vocabs.json'):
-        vocabs = json.loads(open('dataset/predicate_vocabs.json').read())
+    if os.path.exists('../dataset/predicate_vocabs.json'):
+        vocabs = json.loads(open('../dataset/predicate_vocabs.json').read())
     else:
         vocabs = predicate2seq(dataset)
 
@@ -697,7 +697,7 @@ def fit_step():
                     log = f"times: {datetime.now()}, " \
                           f"num: {_}, sub_loss: {loss_sub}, loss_obj: {loss_obj}\n" \
 
-                    f.write(log)
+                    # f.write(log)
                 print(log)
 
         model_sub.save(f'models_save/model_sub/best_model/mid_model/')
