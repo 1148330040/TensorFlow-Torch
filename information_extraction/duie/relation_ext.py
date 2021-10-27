@@ -34,8 +34,8 @@ schema_ds_path = '../dataset/duie/duie_schema/duie_schema.json'
 
 max_len = 128
 
-model_sub_path = f'../models_save/model_sub/best_model/'
-model_obj_path = f'../models_save/model_obj/best_model/'
+model_sub_path = f'models_save/model_sub/'
+model_obj_path = f'models_save/model_obj/'
 
 
 def get_dataset(path):
@@ -160,7 +160,6 @@ def data_generator(dataset):
                 if sub_pos not in spo_all:
                     spo_all[sub_pos] = []
                 spo_all[sub_pos].append(obj_pos)
-
                 # 此处的位置信息是用于保存从多组s-p-o中抽取的那一组s-p-o的位置信息
                 # 该位置信息后续将会用于同bert的encoder编码向量交互用于预测obj和predicate
 
@@ -564,11 +563,13 @@ def predict(content, model_sub, model_obj):
 
     return spos
 
-# (0.6961462153550181, 0.677907555399433, 0.7153934076797143)
-# 2: (0.7027604362542318, 0.6849049964813521, 0.7215717772079957)
-# 3: (0.7040228141496278, 0.6916222096384833, 0.7168762163665018)
-def evaluate(path, model_sub, model_obj):
+
+def evaluate(path):
     """"""
+
+    model_sub = tf.saved_model.load(f'models_save/model_sub/mid_model/')
+    model_obj = tf.saved_model.load(f'models_save/model_obj/mid_model/')
+
     dataset = open(path)
 
     len_lab = 1e-10
@@ -594,7 +595,7 @@ def evaluate(path, model_sub, model_obj):
         spo_labels = set([SPO(spo) for spo in spo_labels])
         spo_predicts = predict(content=text, model_sub=model_sub, model_obj=model_obj)
         spo_predicts = set([SPO(spo) for spo in spo_predicts])
-        if num % 200 == 0:
+        if num % 500 == 0:
             print("spo_labels: ", spo_labels)
             print("spo_predicts: ", spo_predicts)
         len_lab += len(spo_labels)
@@ -608,7 +609,7 @@ def evaluate(path, model_sub, model_obj):
     precision = len_pre_is_true / len_pre
     recall = len_pre_is_true / len_lab
 
-    return f1_value, precision, recall
+    return f1_value
 
 
 def fit_step():
@@ -617,16 +618,11 @@ def fit_step():
 
     model_obj = ModelCrf4Obj(output_dim=len(predicate2id))
 
-    opti_sub = tf.keras.optimizers.Adam(learning_rate=1e-5, beta_1=0.90, beta_2=0.95)
+    opti_sub = tf.keras.optimizers.Adam(learning_rate=2e-5, beta_1=0.90, beta_2=0.95)
+
+    opti_obj = tf.keras.optimizers.Adam(learning_rate=2e-3, beta_1=0.90, beta_2=0.95)
 
     best_f1 = 0.1
-
-    def get_f1():
-        model_sub = tf.saved_model.load(f'models_save/model_sub/best_model/mid_model/')
-        model_obj = tf.saved_model.load(f'models_save/model_obj/best_model/mid_model/')
-        # 此处将模型重新提取出来是因为避免优化器在验证过程中的影响
-        f1, _, _ = evaluate(valid_ds_path, model_sub, model_obj)
-        return f1
 
     def fit_models(inputs_model, inputs_labels, inputs_other):
         positions_sub = inputs_other
@@ -665,7 +661,7 @@ def fit_step():
 
         opti_sub.apply_gradients(zip(params_sub, weights_sub))
 
-        opti_sub.apply_gradients(zip(params_obj, weights_obj))
+        opti_obj.apply_gradients(zip(params_obj, weights_obj))
         # predict: 预测获取的sub, weights: inputs的bert编码层feed&forward层向量
         return predict_sub, predict_obj, loss_sub, loss_obj
 
@@ -691,33 +687,29 @@ def fit_step():
             )
 
             if _ % 500 == 0:
-                with open('models_save/fit_logs.txt', 'a') as f:
-                    # 'a'  要求写入字符
-                    # 'wb' 要求写入字节(str.encode(str))
-                    log = f"times: {datetime.now()}, " \
-                          f"num: {_}, sub_loss: {loss_sub}, loss_obj: {loss_obj}\n" \
+                # 'a'  要求写入字符
+                # 'wb' 要求写入字节(str.encode(str))
+                log = f"times: {datetime.now()}, " \
+                      f"num: {_}, sub_loss: {loss_sub}, loss_obj: {loss_obj}\n" \
 
-                    # f.write(log)
                 print(log)
 
-        model_sub.save(f'models_save/model_sub/best_model/mid_model/')
-        model_obj.save(f'models_save/model_obj/best_model/mid_model/')
+        model_sub.save(model_sub_path + 'mid_model/')
+        model_obj.save(model_obj_path + 'mid_model/')
 
-        f1_value, _, _ = get_f1()
+        f1_value = evaluate(valid_ds_path)
 
         if f1_value > best_f1:
+            print("last f1: ", best_f1)
+            print("new f1: ", f1_value)
             best_f1 = f1_value
             model_sub.save(model_sub_path + 'best_model/')
             model_obj.save(model_obj_path + 'best_model/')
-        else:
-            model_sub = tf.saved_model.load(model_sub_path + 'best_model/')
-            model_obj = tf.saved_model.load(model_obj_path + 'best_model/')
-
-
-# fit_step()
 
 
 def predict_test():
+    model_sub = tf.saved_model.load(model_sub_path + 'best_model/')
+    model_obj = tf.saved_model.load(model_obj_path + 'best_model/')
 
     dataset = open(test_ds_path)
 
@@ -734,25 +726,26 @@ def predict_test():
     schema_ds['object_type'] = schema_ds['schema'].apply(
         lambda x: json.loads(x)['object_type']['@value']
     )
+    with open('duie_result2.json', 'a') as f:
+        for ds in dataset.readlines():
 
-    for ds in dataset.readlines():
-        # 物流作业方法
-        # 数据分析方法五种
-        # 比较新闻传播学
-        spo_test = {'spo_list': []}
-        ds = json.loads(ds)
-        text = ds['text']
-        spo_predict = set(predict(text))
-        spo_test['text'] = text
+            ds = json.loads(ds)
+            text = ds['text']
+            spo_predict = set(predict(text, model_sub, model_obj))
+            result = {'text': text}
 
-        for spo in spo_predict:
-            spos = {}
-            s = spo[0]
-            p = spo[1]
-            o = spo[2]
-            spos['predicate'] = p
-            spos['subject'] = s
-            spos['object'] = {'@value': o}
-            spos['subject_type'] = schema_ds.loc[schema_ds['predicate']==p]['subject_type'].values[0]
-            spos['object_type'] = schema_ds.loc[schema_ds['predicate']==p]['object_type'].values[0]
-            spo_test['spo_list'].append(spos)
+            for spo in spo_predict:
+                spos = {}
+                s = spo[0]
+                p = spo[1]
+                o = spo[2]
+                spos['predicate'] = p
+                spos['subject'] = s
+                spos['object'] = {'@value': o}
+                spos['subject_type'] = schema_ds.loc[schema_ds['predicate']==p]['subject_type'].values[0]
+                spos['object_type'] = {'@value': schema_ds.loc[schema_ds['predicate']==p]['object_type'].values[0]}
+
+            result['spo_list'] = [spos]
+            f.write(json.dumps(result, ensure_ascii=False) + '\n')
+
+predict_test()
