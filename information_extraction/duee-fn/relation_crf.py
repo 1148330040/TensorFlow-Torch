@@ -1,36 +1,38 @@
 import os
 import re
 import json
-import math
-import random
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
 import tensorflow as tf
-
-from bert4keras.snippets import sequence_padding
-from tensorflow.keras import activations, initializers
 import tensorflow_addons as tfa
+
+from datetime import datetime
+from bert4keras.snippets import sequence_padding
 from transformers import BertTokenizer, TFBertModel
 
-
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
+# gpus = tf.config.experimental.list_physical_devices('GPU')
+# # 对需要进行限制的GPU进行设置
+# tf.config.experimental.set_virtual_device_configuration(gpus[0],
+#                                                         [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=0.8)])
+
+
+
 tf.get_logger().setLevel('ERROR')
 
 pd.set_option('display.max_columns', None)
 
-tokenizer = BertTokenizer.from_pretrained("hfl/chinese-bert-wwm-ext")
+tokenizer = BertTokenizer.from_pretrained("hfl/chinese-roberta-wwm-ext")
 
 train_ds_path = '../dataset/duee_fn/duee_fin_train.json/duee_fin_train.json'
 valid_ds_path = '../dataset/duee_fn/duee_fin_dev.json/duee_fin_dev.json'
 test_ds_path = '../dataset/duee_fn/duee_fin_test2.json/duee_fin_test2.json'
-
 sample_ds_path = '../dataset/duee_fn/duee_fin_sample.json'
 schema_ds_path = '../dataset/duee_fn/duee_fin_event_schema.json'
 
-batch_size = 12
+batch_size = 10
 max_len = 256
 # 超出最大长度的将进行滑动处理
 mid_len = 128
@@ -79,30 +81,30 @@ ids2seq = {num: key for num, key in enumerate(all_event_role)}
 
 
 def data_clean(content):
+    try:
+        pattern_1 = "http://[a-zA-Z0-9.?/&=:-_]*"
+        content = re.sub(pattern_1, '', content)
+        pattern_2 = "【\S+】"
+        content = re.sub(pattern_2, '', content)
+        pattern_3 = "\.{2,7}"
+        content = re.sub(pattern_3, '。', content)
+        pattern_4 = "www.[a-zA-Z0-9.?/&=:-]*"
+        content = re.sub(pattern_4, '', content)
 
-    pattern_1 = "http://[a-zA-Z0-9.?/&=:-_]*"
-    content = re.sub(pattern_1, '', content)
-    pattern_2 = "【\S+】"
-    content = re.sub(pattern_2, '', content)
-    pattern_3 = "\.{2,7}"
-    content = re.sub(pattern_3, '。', content)
-    pattern_4 = "www.[a-zA-Z0-9.?/&=:-]*"
-    content = re.sub(pattern_4, '', content)
+        punctuations = ['？', '！', '?', '!']
+        for pun in punctuations:
+            content = content.replace(pun, '。')
 
-    punctuations = ['？', '！', '?', '!']
-    for pun in punctuations:
-        content = content.replace(pun, '。')
+        for pun in ['●', '■', '\n', '\t', '\u2003']:
+            content = content.replace(pun, ' ')
 
-    for pun in ['●', '■', '\n', '\t', '\u2003']:
-        content = content.replace(pun, ' ')
+        content = content[:-1] if content[-1] == '。' else content
 
-    content = content[:-1] if content[-1] == '。' else content
-
-    pattern_5 = '[\s]+'
-    content = re.sub(pattern_5, ' ', content)
-
-
-    return content.strip()
+        pattern_5 = '[\s]+'
+        content = re.sub(pattern_5, ' ', content)
+        return content.strip()
+    except:
+        return content
 
 
 def get_seq_pos(seq, input_id):
@@ -177,7 +179,10 @@ def data_generator(path):
                 event_role = event_type + '&' + role
                 role_arguments[seq2ids[event_role]] = argument_text
 
-        contents = slide_contents(contents)
+        if len(contents) > max_len:
+            contents = slide_contents(contents)
+        else:
+            contents = [contents]
         #-----------------------------------------
         # encode
 
@@ -230,7 +235,7 @@ class BertCrf4Role(tf.keras.Model):
         super(BertCrf4Role, self).__init__(output_dim)
         self.output_dim = output_dim
 
-        self.bert = TFBertModel.from_pretrained('hfl/chinese-bert-wwm-ext', output_hidden_states=True)
+        self.bert = TFBertModel.from_pretrained('hfl/chinese-roberta-wwm-ext', output_hidden_states=True)
 
         self.dropout = tf.keras.layers.Dropout(0.3)
 
@@ -265,23 +270,26 @@ class BertCrf4Role(tf.keras.Model):
         return decode_predict, log_likelihood
 
 
-def get_predict_seq(content):
-    inputs = tokenizer.encode_plus(content)
+def get_predict_seq(contents):
+    input_ids = []
+    input_masks = []
+    token_type_ids = []
+    id_lengths = []
+    for content in contents:
+        inputs = tokenizer.encode_plus(content)
 
-    input_id = tf.constant([inputs['input_ids']], dtype=tf.int32)
-    input_mask = tf.constant([inputs['attention_mask']], dtype=tf.int32)
-    token_type_ids = tf.constant([inputs["token_type_ids"]], dtype=tf.int32)
+        input_ids.append(tf.constant(inputs['input_ids'], dtype=tf.int32))
+        input_masks.append(tf.constant(inputs['attention_mask'], dtype=tf.int32))
+        token_type_ids.append(tf.constant(inputs["token_type_ids"], dtype=tf.int32))
 
-    if len(input_id) > max_len - 1:
-        return None
+        id_lengths.append(len(inputs['input_ids']))
 
-    id_length = len(input_id[0])
 
-    input_id = sequence_padding(input_id, length=max_len)
-    input_mask = sequence_padding(input_mask, length=max_len)
+    input_ids = sequence_padding(input_ids, length=max_len)
+    input_masks = sequence_padding(input_masks, length=max_len)
     token_type_ids = sequence_padding(token_type_ids, length=max_len)
 
-    return [input_id, input_mask, token_type_ids, id_length]
+    return [input_ids, input_masks, token_type_ids, id_lengths]
 
 
 def get_poses(predict_value):
@@ -302,40 +310,42 @@ def get_poses(predict_value):
     return poses
 
 
-def predict(content, model):
+def predict(contents, model):
 
-    ids, masks, tokens, id_length = get_predict_seq(content)
+    ids, masks, tokens, id_lengths = get_predict_seq(contents)
 
-    none_labels = np.zeros(shape=(1, max_len))
+    none_labels = np.zeros(shape=(len(contents), max_len))
     none_labels = tf.constant(none_labels, dtype=tf.float32)
 
-    predict_value, _ = model((ids, masks, tokens, none_labels))
-    predict_value = predict_value[0]
-    predict_poses = get_poses(np.array(predict_value))
+    predict_values, _ = model((ids, masks, tokens, none_labels))
 
     predict_spo = []
 
-    for p_pos in predict_poses:
+    for id_, predict_value, id_length in zip(ids, predict_values, id_lengths):
 
-        if len(p_pos) == 0 or p_pos[-1] > id_length + 1:
-            continue
+        predict_poses = get_poses(np.array(predict_value))
 
-        event_role_id = predict_value[p_pos[0]]
+        for p_pos in predict_poses:
 
-        event_role =  ids2seq[int(event_role_id)]
-        event = event_role.split('&')[0]
-        role = event_role.split('&')[1]
+            if len(p_pos) == 0 or p_pos[-1] > id_length + 1:
+                continue
 
-        argument = np.array(ids[0][p_pos[0]:(p_pos[-1] + 1)])
-        argument = ''.join(tokenizer.decode(argument).split(' ')).strip()
+            event_role_id = predict_value[p_pos[0]]
 
-        predict_spo.append(
-            (
-             event,
-             role,
-             argument
+            event_role =  ids2seq[int(event_role_id)]
+            event = event_role.split('&')[0]
+            role = event_role.split('&')[1]
+
+            argument = np.array(id_[p_pos[0]:(p_pos[-1] + 1)])
+            argument = ''.join(tokenizer.decode(argument).split(' ')).strip()
+
+            predict_spo.append(
+                (
+                 event,
+                 role,
+                 argument
+                )
             )
-        )
 
     return predict_spo
 
@@ -344,7 +354,7 @@ def valid():
 
     dataset = open(valid_ds_path)
 
-    model = tf.saved_model.load(model_path + f'mid_model/')
+    model = tf.saved_model.load(model_path + f'mid_model_robert/')
 
     def get_spo_values(events):
         spo = []
@@ -378,6 +388,7 @@ def valid():
         except:
             continue
         contents = data_clean(contents)
+        contents = slide_contents(contents)
         predict_spo = predict(contents, model)
 
         len_lab += len(label_spo)
@@ -389,6 +400,58 @@ def valid():
     recall = len_pre_is_true / len_lab
 
     return f1_value
+
+
+def get_predict_result():
+
+    dataset = open('../dataset/duee_fn/duee_fin_test2.json/duee_fin_1.json')
+
+    model = tf.saved_model.load(model_path + f'best_model_robert/')
+
+    with open('duee-fin-1.json', 'a', encoding='utf-8') as f:
+        for epoch, ds in enumerate(dataset.readlines()):
+
+            ds = json.loads(ds)
+            id_ = ds['id']
+            results = {'id': id_, 'event_list': []}
+            content = ds['text']
+
+            if len(content) < 1:
+                continue
+
+            content = data_clean(content)
+
+            contents = slide_contents(content)
+
+            spo = predict(contents, model)
+            if len(spo) == 0:
+                continue
+
+            all_spo = list(set(spo))
+            result = {}
+            for spo in all_spo:
+                event = spo[0]
+                role = spo[1]
+                argument = spo[2]
+                value = {'role': role, 'argument': argument}
+
+                if event not in result:
+                    result[event] = []
+
+                result[event].append(value)
+            for key, value in result.items():
+                results['event_list'].append(
+                    {
+                        'event_type': key,
+                        'arguments': value
+                    }
+                )
+
+            if (epoch + 1) % 1000 == 0:
+                print(f"time: {datetime.now()}, epoch: {epoch}")
+
+            f.write(json.dumps(results, ensure_ascii=False) + '\n')
+
 
 
 def fit():
@@ -446,12 +509,12 @@ def fit():
                 labels=role_label,
             )
 
-            if _ % 400 == 0:
+            if _ % 1000 == 0:
                 print(f"times: {datetime.now()}, epoch: {_}, loss: {loss}")
                 print("role_predict: ", predict[0])
                 print("role_label: ", role_label[0])
 
-        model.save(model_path + f'mid_model/')
+        model.save(model_path + f'mid_model_robert/')
 
         f1_v = valid()
 
@@ -459,7 +522,7 @@ def fit():
         print("new f1: ", f1_v)
 
         if f1_v > f1_value:
-            model.save(model_path + 'best_model/')
+            model.save(model_path + 'best_model_robert/')
             f1_value = f1_v
 
 fit()
