@@ -1,4 +1,3 @@
-#! -*- coding:utf-8 -*-
 # tf版本GPlink
 # 源代码相关来自苏神:
 # 三元组抽取任务，基于GlobalPointer的仿TPLinker设计
@@ -46,10 +45,10 @@ def get_dataset(path):
     """
     dataset = open(path)
     spo_ds = []
-
     for ds in dataset.readlines():
         ds = json.loads(ds)
         text = ds['text']
+        text = text.replace('\t', '').replace(' ', '')
         if len(text) > max_len:
             continue
 
@@ -61,6 +60,8 @@ def get_dataset(path):
     spo_ds = pd.DataFrame(spo_ds)
 
     return spo_ds
+
+get_dataset(path=train_ds_path)
 
 
 def predicate2seq(dataset):
@@ -569,25 +570,23 @@ def predict(model, text, threshold=0):
             p2s = np.where(outputs[2][:, st, ot] > threshold)[0]
             # 效果同上只是获取的tai_predict
             ps = set(p1s) & set(p2s)
-            print(ps)
-            print(sh, st)
-            print(oh, ot)
+
             for p in ps:
                 s = tokenizer.decode(input_id[0][sh:(st+1)]).replace(' ', '')
                 o = tokenizer.decode(input_id[0][oh:(ot+1)]).replace(' ', '')
-
+                try:
+                    p = id2predicate[p]
+                except:
+                    p = None
                 for mask in ['[SEP]', '[PAD]', '[UNK]', '[UNK]']:
                     while mask in o:
                         o = o.replace(mask, '')
                     while mask in s:
                         s = s.replace(mask, '')
 
-                spoes.add((
-                    s, id2predicate[p], o))
-            print(spoes)
+                spoes.add((s, p, o))
 
     return list(spoes)
-
 
 class SPO(tuple):
     """用来存三元组的类
@@ -612,19 +611,34 @@ def evaluate():
     """评估函数，计算f1、precision、recall
     """
     model = tf.saved_model.load('model_save/mid_model/')
-    len_label, len_predict, len_lab_pre = 1e-10, 1e-10, 1e-10
+    len_lab = 1e-10
+    len_pre = 1e-10
+    len_pre_is_true = 1e-10
+
     data = get_dataset(valid_ds_path)
-    for d in data:
+
+    def process(word):
+        while ' ' in word:
+            word = word.replace(' ', '')
+        return word.lower()
+
+    for _, d in data.iterrows():
         predict_value = set([SPO(spo) for spo in predict(model, d['text'])])
-        label_value = set([SPO(spo) for spo in d['spo_list']])
+        label_value = set([(process(spo['subject']), spo['predicate'], process(word=spo['object']['@value'])) for spo in d['spo_list']])
+        label_value = set([SPO(spo) for spo in label_value])
 
-        len_lab_pre += len(predict_value & label_value)
-        len_predict += len(predict_value)
-        len_label += len(label_value)
+        len_lab += len(label_value)
+        len_pre += len(predict_value)
+        len_pre_is_true += len(label_value & predict_value)
 
-    f1_value = 2 * len_lab_pre / (len_label + len_predict)
-    precision = len_lab_pre / len_predict
-    recall = len_lab_pre / len_label
+
+    f1_value = 2 * len_pre_is_true / (len_lab + len_pre)
+    precision = len_pre_is_true / len_pre
+    recall = len_pre_is_true / len_lab
+
+    # f1_value = 2 * len_lab_pre / (len_label + len_predict)
+    # precision = len_lab_pre / len_predict
+    # recall = len_lab_pre / len_label
 
     return f1_value, precision, recall
 
@@ -699,5 +713,6 @@ def fit():
             model.save('model_save/best_model')
             f1_value = f1
 
-fit()
+# fit()
 
+print(evaluate())
